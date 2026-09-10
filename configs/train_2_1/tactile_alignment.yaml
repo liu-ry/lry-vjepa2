@@ -1,0 +1,63 @@
+# 在冻结的 V-JEPA 2.1 视觉编码器上，训练触觉 tubelet-ViT 和 token 级未来 latent 预测器。
+#
+# n/m 写在这里，不写死在代码里：
+#   context（或 input_frames）  = n，历史视触帧
+#   horizon（或 output_frames） = m，数据窗口的最大未来长度
+# 每条 manifest clip 至少 n + m 帧，且 n、m 都必须是 model.tubelet_size 的倍数。
+#
+# python -m app.vjepa_2_1.train_tactile_alignment \
+#   --config configs/train_2_1/tactile_alignment.yaml \
+#   --vjepa-checkpoint /path/to/vjepa2.1.pt \
+#   --stage align
+manifest: /path/to/robot_manifest.jsonl
+context: 4              # n: 观测窗口（历史视触帧）
+horizon: 30             # m: 数据窗口的最大未来长度
+future_offsets: [6, 10, 16, 20, 26, 30]  # 落在 2 帧 latent 格上的 raw-frame waypoint
+# 训练时每个 batch 重新采样 query 时刻。推理时向 predictor.forward(...) 显式传入 future_offsets。
+random_future_offsets: true
+random_future_count: 6
+random_future_min_offset: 2
+seed: 0                  # 控制每个 batch 的随机 waypoint 序列
+visual_tubelet_size: 2  # V-JEPA 2/2.1 默认；必须与 checkpoint 一致
+crop_size: 256
+normalize_vision: true
+num_workers: 4
+model:
+  model_name: vit_large
+  patch_size: 16
+  tubelet_size: 2          # V-JEPA 视觉 tubelet；必须与 checkpoint 一致
+  use_rope: true
+  predictor_dim: 512
+  predictor_depth: 6
+  predictor_heads: 8
+  num_condition_tokens: 16   # 给下游 flow matching expert 的读出 query
+  condition_out_dim: null    # 默认等于 predictor_dim；可设成 expert 隐宽
+  # max_context: 4      # 可选；默认 context / tubelet_size
+state:
+  dim: null             # 设成本体状态维度；manifest 每条记录都要有 state 路径
+batch_size: 4           # 4+30 token 较长；显存不够就减小
+epochs: 50
+joint_unfreeze_visual: false  # 仅在机器人数据足够时设 true；视觉用 0.1× 学习率
+tactile:
+  type: image              # image 或 vector
+  in_channels: 3
+  patch_size: 16           # 空间 tubelet；保持较小以免毁掉接触几何
+  tubelet_size: 1          # 必须：部署时触觉 context 是单帧
+  img_size: 224            # 编码器内空间 resize；null 保持原始尺寸
+  embed_dim: 384
+  depth: 6
+  num_heads: 6
+  use_rope: true
+  input_dim: null          # 向量/taxel 输入时设置
+  taxel_grid: null         # 例如 [4, 4]，把展平 taxel 图当单通道图像
+loss:
+  lambda_global: 1.0
+  lambda_latent: 0.3
+  lambda_temporal: 0.1
+  lambda_future_visual: 1.0
+  lambda_future_tactile: 1.0
+  temperature: 0.07
+optimization:
+  lr_tactile: 0.0001
+  lr_predictor: 0.0003
+  ema: 0.996

@@ -326,7 +326,7 @@ class Attention(nn.Module):
         self.use_sdpa = use_sdpa
         self.is_causal = is_causal
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
@@ -334,15 +334,18 @@ class Attention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
+        causal = self.is_causal if attn_mask is None else False
 
         if self.use_sdpa:
             with torch.backends.cuda.sdp_kernel():
                 x = F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
+                    q, k, v, attn_mask=attn_mask, dropout_p=self.proj_drop_prob, is_causal=causal
                 )
                 attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
+            if attn_mask is not None:
+                attn = attn + attn_mask
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
@@ -435,6 +438,7 @@ class Block(nn.Module):
         W_patches=None,
         return_attn=False,
         mode="video",
+        attn_mask=None,
     ):
         if self.use_rope:
             y, attn = self.attn(
@@ -446,7 +450,7 @@ class Block(nn.Module):
                 return_attn=return_attn,
             )
         else:
-            y = self.attn(self.norm1(x))
+            y = self.attn(self.norm1(x), attn_mask=attn_mask)
             attn = None
         x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
