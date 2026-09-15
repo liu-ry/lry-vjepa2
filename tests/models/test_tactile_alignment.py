@@ -6,7 +6,17 @@ from app.vjepa_2_1.models.residual_correction import LatentResidualController
 from app.vjepa_2_1.models.tactile_alignment import TactileAlignment, TactileEncoder
 from app.vjepa_2_1.train_tactile_alignment import (
     MultimodalTrainer,
+    WarmupCosineMultiplier,
+    best_checkpoint,
     future_offsets_from_config,
+    output_from_config,
+    prune_checkpoints,
+    record_checkpoint_metrics,
+    resume_from_config,
+    save_tensorboard_curves,
+    should_save_epoch,
+    split_indices,
+    unique_output_dir,
     window_from_config,
     sample_future_offsets,
 )
@@ -18,6 +28,158 @@ from app.vjepa_2_1.visualize_latents import (
     pca_maps,
     step_cosine,
 )
+
+
+def test_vjepa_predictor_accepts_noncanonical_depth():
+    from app.vjepa_2_1.models.predictor import vit_predictor
+
+    model = vit_predictor(
+        embed_dim=32, predictor_embed_dim=16, depth=1, num_heads=2, use_rope=False
+    )
+    assert model.hierarchical_layers == [0]
+
+
+def test_unique_output_dir_appends_incrementing_suffix():
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tempfile.mkdtemp())
+    base = root / "tactile_align"
+    assert unique_output_dir(base) == str(base)
+    base.mkdir()
+    first = Path(unique_output_dir(base))
+    assert first.name == "tactile_align(1)"
+    first.mkdir()
+    second = Path(unique_output_dir(base))
+    assert second.name == "tactile_align(2)"
+    second.mkdir()
+    (root / "tactile_align(5)").mkdir()
+    assert Path(unique_output_dir(base)).name == "tactile_align(6)"
+    (base / "checkpoint_0001.pt").write_bytes(b"a")
+    assert unique_output_dir(base, resume=str(base / "checkpoint_0001.pt")) == str(base)
+    (first / "checkpoint_0002.pt").write_bytes(b"b")
+    assert unique_output_dir(base, resume=str(first / "checkpoint_0002.pt")) == str(first)
+
+
+def test_save_tensorboard_curves_writes_pngs():
+    import tempfile
+    from pathlib import Path
+    from torch.utils.tensorboard import SummaryWriter
+
+    root = Path(tempfile.mkdtemp())
+    log_dir = root / "tensorboard"
+    writer = SummaryWriter(log_dir=str(log_dir))
+    writer.add_scalar("loss/train", 1.0, 1)
+    writer.add_scalar("loss/val", 1.2, 1)
+    writer.add_scalar("loss/train", 0.8, 2)
+    writer.add_scalar("loss/val", 0.9, 2)
+    writer.add_scalar("loss/train_step", 1.1, 1)
+    writer.add_scalar("loss_global/train", 0.7, 1)
+    writer.flush()
+    writer.close()
+    saved = save_tensorboard_curves(log_dir, root / "curves")
+    names = {path.name for path in saved}
+    assert "loss.png" in names
+    assert "loss_train_step.png" in names
+    assert "loss_global.png" in names
+    assert "overview.png" in names
+    for path in saved:
+        assert path.is_file() and path.stat().st_size > 0
+
+
+def test_should_save_epoch_every_ten_and_last():
+    saved = [i for i in range(1, 51) if should_save_epoch(i, 10, is_last=(i == 50))]
+    assert saved == [10, 20, 30, 40, 50]
+    assert should_save_epoch(7, 10, is_last=True)
+    assert not should_save_epoch(7, 10, is_last=False)
+
+
+def test_output_from_config_picks_stage_directory():
+    cfg = {"training": {"output": {"align": "out/align", "joint": "out/joint"}}}
+    assert output_from_config(cfg, "align") == "out/align"
+    assert output_from_config(cfg, "joint") == "out/joint"
+    assert output_from_config(cfg, "joint", override="tmp/joint") == "tmp/joint"
+    try:
+        output_from_config({"training": {"output": {"align": "out/align"}}}, "joint")
+    except ValueError as exc:
+        assert "output.joint" in str(exc)
+        return
+    raise AssertionError("expected ValueError when the stage output directory is missing")
+
+
+def test_best_checkpoint_uses_lowest_recorded_loss(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tempfile.mkdtemp()) if tmp_path is None else Path(tmp_path)
+    (root / "checkpoint_0001.pt").write_bytes(b"a")
+    (root / "checkpoint_0002.pt").write_bytes(b"b")
+    (root / "checkpoint_step_0003.pt").write_bytes(b"c")
+    record_checkpoint_metrics(root, "checkpoint_0001.pt", 1, {"loss": 0.40})
+    record_checkpoint_metrics(root, "checkpoint_0002.pt", 2, {"loss": 0.55})
+    chosen = best_checkpoint(root)
+    assert chosen.name == "checkpoint_0001.pt"
+
+
+def test_best_checkpoint_falls_back_to_latest_epoch():
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tempfile.mkdtemp())
+    (root / "checkpoint_step_0009.pt").write_bytes(b"s")
+    (root / "checkpoint_0001.pt").write_bytes(b"a")
+    (root / "checkpoint_0003.pt").write_bytes(b"b")
+    assert best_checkpoint(root).name == "checkpoint_0003.pt"
+
+
+def test_joint_resume_defaults_to_best_align_checkpoint():
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tempfile.mkdtemp())
+    align = root / "align"
+    align.mkdir()
+    (align / "checkpoint_0001.pt").write_bytes(b"a")
+    (align / "checkpoint_0002.pt").write_bytes(b"b")
+    record_checkpoint_metrics(align, "checkpoint_0001.pt", 1, {"loss": 0.2})
+    record_checkpoint_metrics(align, "checkpoint_0002.pt", 2, {"loss": 0.9})
+    cfg = {"training": {"output": {"align": str(align), "joint": str(root / "joint")}}}
+    assert resume_from_config(cfg, "align") is None
+    assert Path(resume_from_config(cfg, "joint")).name == "checkpoint_0001.pt"
+    assert resume_from_config(cfg, "joint", override="explicit.pt") == "explicit.pt"
+    assert resume_from_config(cfg, "joint", override=False) is None
+
+
+def test_prune_checkpoints_keeps_best_and_latest():
+    import tempfile
+    from pathlib import Path
+
+    root = Path(tempfile.mkdtemp())
+    for i in range(1, 5):
+        (root / f"checkpoint_{i:04d}.pt").write_bytes(b"x" * 10)
+    (root / "checkpoint_step_0009.pt").write_bytes(b"s")
+    record_checkpoint_metrics(root, "checkpoint_0002.pt", 2, {"loss": 0.1})
+    record_checkpoint_metrics(root, "checkpoint_0004.pt", 4, {"loss": 0.5})
+    removed = prune_checkpoints(root, keep_last=1)
+    names = sorted(p.name for p in root.glob("*.pt"))
+    assert "checkpoint_0002.pt" in names
+    assert "checkpoint_0004.pt" in names
+    assert "checkpoint_0001.pt" not in names
+    assert "checkpoint_step_0009.pt" not in names
+    assert "checkpoint_0001.pt" in removed
+
+
+def test_split_indices_is_disjoint_and_reproducible():
+    train_a, val_a = split_indices(10, val_ratio=0.2, seed=0)
+    train_b, val_b = split_indices(10, val_ratio=0.2, seed=0)
+    train_c, val_c = split_indices(10, val_ratio=0.2, seed=1)
+    assert len(val_a) == 2
+    assert len(train_a) == 8
+    assert sorted(train_a + val_a) == list(range(10))
+    assert set(train_a).isdisjoint(val_a)
+    assert (train_a, val_a) == (train_b, val_b)
+    assert (train_a, val_a) != (train_c, val_c)
+    assert split_indices(10, val_ratio=0.0, seed=0)[1] == []
 
 
 def test_window_from_config_n_and_m():
@@ -201,6 +363,28 @@ class _DummyVisual(nn.Module):
         pooled = x.mean(dim=(3, 4)).permute(0, 2, 1)
         z = self.proj(pooled).unsqueeze(2).expand(batch, time, self.tokens, self.embed_dim)
         return z.reshape(batch, time * self.tokens, self.embed_dim)
+
+
+def test_warmup_cosine_peaks_then_decays_and_keeps_group_ratios():
+    a = torch.nn.Parameter(torch.zeros(1))
+    b = torch.nn.Parameter(torch.zeros(1))
+    opt = torch.optim.SGD([{"params": [a], "lr": 0.1}, {"params": [b], "lr": 0.3}])
+    sched = WarmupCosineMultiplier(
+        opt, total_steps=10, warmup_steps=2, start_lr_scale=0.0, min_lr_scale=0.0
+    )
+    lrs = [sched.get_last_lr()]
+    for _ in range(10):
+        sched.step()
+        lrs.append(sched.get_last_lr())
+    assert abs(lrs[0][0] - 0.05) < 1e-6
+    assert abs(lrs[0][1] - 0.15) < 1e-6
+    assert abs(lrs[1][0] - 0.1) < 1e-6
+    assert abs(lrs[1][1] - 0.3) < 1e-6
+    peak = max(lr[0] for lr in lrs)
+    assert abs(peak - 0.1) < 1e-6
+    assert lrs[-1][0] < lrs[2][0]
+    assert abs(lrs[-1][0]) < 1e-6
+    assert all(abs(lr[1] / lr[0] - 3.0) < 1e-6 for lr in lrs if lr[0] > 0)
 
 
 def test_trainer_joint_step_predicts_spatial_future():

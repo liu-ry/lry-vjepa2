@@ -5,11 +5,17 @@
 #   horizon（或 output_frames） = m，数据窗口的最大未来长度
 # 每条 manifest clip 至少 n + m 帧，且 n、m 都必须是 model.tubelet_size 的倍数。
 #
-# python -m app.vjepa_2_1.train_tactile_alignment \
-#   --config configs/train_2_1/tactile_alignment.yaml \
-#   --vjepa-checkpoint /path/to/vjepa2.1.pt \
-#   --stage align
-manifest: /path/to/robot_manifest.jsonl
+# 训练时只需传入本配置文件；阶段、checkpoint 和输出目录都在 training 中设置。
+manifest: /home/lry/data/jepa/data/fast_umi_data_converted/manifest.jsonl
+training:
+  stage: align                         # align 或 joint
+  vjepa_checkpoint: /home/lry/data/jepa/model/vjepa2_1_vitb_dist_vitG_384.pt
+  resume: null                         # joint 默认从 output.align 选最优；也可填路径 / auto
+  keep_checkpoints: 1                  # 除 best 外只保留最近 N 个 epoch 文件
+  save_every: 10                       # 每 N 个 epoch 存一次；最后一个 epoch 也会存
+  output:
+    align: /home/lry/data/jepa/outputs/tactile_align
+    joint: /home/lry/data/jepa/outputs/tactile_joint
 context: 4              # n: 观测窗口（历史视触帧）
 horizon: 30             # m: 数据窗口的最大未来长度
 future_offsets: [6, 10, 16, 20, 26, 30]  # 落在 2 帧 latent 格上的 raw-frame waypoint
@@ -17,16 +23,21 @@ future_offsets: [6, 10, 16, 20, 26, 30]  # 落在 2 帧 latent 格上的 raw-fra
 random_future_offsets: true
 random_future_count: 6
 random_future_min_offset: 2
-seed: 0                  # 控制每个 batch 的随机 waypoint 序列
+seed: 0                  # 划分训练/验证集，以及每个 batch 的随机 waypoint
+val_ratio: 0.2           # 训练前随机划出的验证集比例
+tensorboard: true        # 曲线写到 training.output.<stage>/tensorboard
 visual_tubelet_size: 2  # V-JEPA 2/2.1 默认；必须与 checkpoint 一致
-crop_size: 256
+crop_size: 384           # 必须与 vjepa2.1 vitb-384 checkpoint 一致
 normalize_vision: true
-num_workers: 4
+num_workers: 2
 model:
-  model_name: vit_large
+  model_name: vit_base     # 对应本地 vjepa2_1_vitb_dist_vitG_384.pt
   patch_size: 16
   tubelet_size: 2          # V-JEPA 视觉 tubelet；必须与 checkpoint 一致
   use_rope: true
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+  use_sdpa: true
   predictor_dim: 512
   predictor_depth: 6
   predictor_heads: 8
@@ -34,8 +45,10 @@ model:
   condition_out_dim: null    # 默认等于 predictor_dim；可设成 expert 隐宽
   # max_context: 4      # 可选；默认 context / tubelet_size
 state:
-  dim: null             # 设成本体状态维度；manifest 每条记录都要有 state 路径
-batch_size: 4           # 4+30 token 较长；显存不够就减小
+  # VT-UMI 默认将 vio_pose（7 维）与 gripper（1 维）拼接为 state。
+  # 如果数据中的状态维度不同，请改成拼接后数组的最后一维大小。
+  dim: 8
+batch_size: 2           # 384px、4+30 帧；8GB 上 2 可跑 InfoNCE，OOM 再改回 1
 epochs: 50
 joint_unfreeze_visual: false  # 仅在机器人数据足够时设 true；视觉用 0.1× 学习率
 tactile:
@@ -61,3 +74,6 @@ optimization:
   lr_tactile: 0.0001
   lr_predictor: 0.0003
   ema: 0.996
+  warmup_epochs: 5          # 线性升到峰值；0 表示不做 warmup
+  start_lr_scale: 0.01      # warmup 起点 = scale * 峰值 lr
+  min_lr_scale: 0.01        # 余弦退火终点 = scale * 峰值 lr

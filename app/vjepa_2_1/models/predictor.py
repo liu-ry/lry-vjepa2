@@ -74,6 +74,13 @@ class VisionTransformerPredictor(nn.Module):
             all_hierarchical_layers = [4, 11, 17, 23]
         elif depth == 40:
             all_hierarchical_layers = [9, 19, 29, 39]
+        elif depth > 0:
+            # Canonical V-JEPA depths are listed above. Other depths (including
+            # the dummy predictor the tactile trainer used to construct) only
+            # need the last layer.
+            all_hierarchical_layers = [depth - 1]
+        else:
+            raise ValueError(f"predictor depth must be positive, got {depth}")
 
         n_output_distillation = kwargs.get("n_output_distillation", len(all_hierarchical_layers))
         self.hierarchical_layers = all_hierarchical_layers[-n_output_distillation:]

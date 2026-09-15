@@ -28,10 +28,13 @@ class RobotVisionTactileDataset(Dataset):
                  state_transform=None, random_crop=True, require_state=False,
                  vision_size=None, normalize_vision=True,
                  vision_mean=(0.485, 0.456, 0.406),
-                 vision_std=(0.229, 0.224, 0.225)):
+                 vision_std=(0.229, 0.224, 0.225), items=None):
         self.root = Path(manifest).parent
-        with open(manifest, "r", encoding="utf-8") as f:
-            self.items = [json.loads(x) for x in f if x.strip()]
+        if items is None:
+            with open(manifest, "r", encoding="utf-8") as f:
+                self.items = [json.loads(x) for x in f if x.strip()]
+        else:
+            self.items = list(items)
         if not self.items:
             raise ValueError("manifest is empty")
         if any("vision" not in r or "tactile" not in r for r in self.items):
@@ -96,7 +99,13 @@ class RobotVisionTactileDataset(Dataset):
         if usable < n: raise ValueError("sequence shorter than context+horizon")
         start = random.randint(0, usable - n) if self.random_crop and usable > n else 0
         v, t = v[start:start+n], t[start:start+n]
-        if s is not None: s = s[start:start+n]
+        if s is not None:
+            s = s[start:start+n]
+            # Scalar gripper exports are commonly stored as ``[T]``. Keep
+            # the feature dimension explicit so the state encoder receives
+            # ``[B,T,Ds]`` after collation (for the default Ds=1 config).
+            if s.ndim == 1:
+                s = s[:, None]
         if a is not None: a = a[start:start+n]
         if self.transform: v = self.transform(v)
         v = self._prepare_vision(v)

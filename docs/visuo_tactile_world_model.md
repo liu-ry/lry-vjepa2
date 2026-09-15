@@ -208,24 +208,49 @@ python -m app.vjepa_2_1.convert_lerobot \
   --output /data/vjepa_manifest
 ```
 
-转换后的 `manifest.jsonl` 填入 `configs/train_2_1/tactile_alignment.yaml` 的 `manifest`。视觉和 GelSight 必须有相同的帧率、episode 边界和时间顺序；`state` 可选，但启用 `state.dim` 后每条记录都必须有它。LeRobot 的 `action` 会被保留，当前 latent trainer 不直接使用它，后续可用于训练残差控制器。
-先在数据准备环境安装 `lerobot`。转换后视觉数组应为 `[T,3,H,W]`，GelSight 为 `[T,C,H,W]`（灰度传感器把 `tactile.in_channels` 设为 1），本体状态为 `[T,D]`，action 为 `[T,A]`；`T` 必须至少是 `context + horizon`。
+转换后的 `manifest.jsonl` 填入 `configs/train_2_1/tactile_alignment.yaml` 的 `manifest`。视觉和 GelSight 必须有相同的帧率、episode 边界和时间顺序；当前默认配置启用 8 维 `state`（7 维 `vio_pose` + 1 维 `gripper`），因此每条 manifest 记录都必须包含 state 路径。若改回 `state.dim: null` 才可省略状态。LeRobot 的 `action` 会被保留，当前 latent trainer 不直接使用它，后续可用于训练残差控制器。
+
+对于 VT-UMI 原始目录（每个 `episode_*/left_hand` 下有 `rgb.mp4`、
+`tactile_left.mp4`、`tactile_right.mp4`），可直接转换，无需安装 LeRobot：
 
 ```bash
-# 1）相对冻结 V-JEPA 热身触觉编码器
-python -m app.vjepa_2_1.train_tactile_alignment \
-  --config configs/train_2_1/tactile_alignment.yaml \
-  --vjepa-checkpoint /path/to/vjepa2.1.pt \
-  --stage align \
-  --output outputs/tactile_align
+python -m app.vjepa_2_1.convert_lerobot \
+  --format umi \
+  --root /home/lry/data/VT_UMI/fast_umi_data_sync_0324 \
+  --output /home/lry/data/VT_UMI/fast_umi_manifest \
+  --include-state
+```
 
-# 2）训练未来 N 帧预测器
+两个指间触觉视频会按水平方向拼接，保留为一个 3 通道触觉帧；使用
+`left_hand/vio_pose.npy` 与 `left_hand/gripper.npy` 按特征维拼接后导出为 `state`。
+当前默认 `state.dim: 8`（7+1）；如果数据中的数组维度不同，请按拼接后的最后一维调整配置。
+先在数据准备环境安装 `lerobot`。转换后视觉数组应为 `[T,3,H,W]`，GelSight 为 `[T,C,H,W]`（灰度传感器把 `tactile.in_channels` 设为 1），本体状态为 `[T,D]`，action 为 `[T,A]`；`T` 必须至少是 `context + horizon`。
+
+训练参数（阶段、V-JEPA checkpoint、resume checkpoint、输出目录）都放在
+`configs/train_2_1/tactile_alignment.yaml` 的 `training` 节中。日常运行只需传配置：
+
+```bash
 python -m app.vjepa_2_1.train_tactile_alignment \
-  --config configs/train_2_1/tactile_alignment.yaml \
-  --vjepa-checkpoint /path/to/vjepa2.1.pt \
-  --resume outputs/tactile_align/checkpoint_0050.pt \
-  --stage joint \
-  --output outputs/tactile_joint
+  --config configs/train_2_1/tactile_alignment.yaml
+```
+
+第一阶段将 `training.stage` 设为 `align`、`training.resume: null`；完成后将其改为
+`joint` 即可。joint 会在 `training.output.align` 里按 `metrics.json` 的最低 loss
+自动选 checkpoint（没有 loss 记录则用最新的 `checkpoint_XXXX.pt`）。
+`training.output.align` 与 `training.output.joint` 分开写，换阶段不必改输出目录。
+若 `name` 或 `name(n)` 已存在，新的一次训练写到 `name(max+1)`，例如已有 `(1)` 则建 `(2)`。
+默认每 `training.save_every`（10）个 epoch 存一次，最后一个 epoch 也会存。
+学习率是线性 warmup（`optimization.warmup_epochs`）再余弦退火到
+`min_lr_scale *` 峰值 lr；触觉编码器和预测器共用同一条倍率曲线。
+命令行仍支持用 `--resume` 指定路径或 `auto`。
+
+训练前按 `seed` 把 manifest clip 随机划成训练集和验证集（默认 `val_ratio: 0.2`），
+划分结果写在输出目录的 `split.json`。TensorBoard 曲线在
+`training.output.<stage>/tensorboard`，同一指标的 `.../train` 与 `.../val` 会叠在一张图上。
+训练结束时会读取这些日志，把全部曲线渲染成 PNG，保存在同级的 `curves/` 目录。
+
+```bash
+tensorboard --logdir /home/lry/data/jepa/outputs/tactile_align/tensorboard
 ```
 
 代码对应关系：

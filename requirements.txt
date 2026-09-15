@@ -1,6 +1,7 @@
 torch>=2
 torchvision
 tensorboard
+matplotlib
 wandb
 iopath
 pyyaml

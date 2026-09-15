@@ -212,6 +212,7 @@ def init_video_model(
     has_cls_first=False,
     interpolate_rope=False,
     modality_embedding=False,
+    build_predictor=True,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -233,6 +234,16 @@ def init_video_model(
         modality_embedding=modality_embedding,
     )
     encoder = MultiSeqWrapper(encoder)
+    encoder.to(device)
+    logger.info(encoder)
+
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    logger.info(f"Encoder number of parameters: {count_parameters(encoder)}")
+    if not build_predictor:
+        return encoder, None
+
     predictor = vit_pred.__dict__["vit_predictor"](
         img_size=crop_size,
         use_mask_tokens=use_mask_tokens,
@@ -263,16 +274,8 @@ def init_video_model(
         img_temporal_dim_size=img_temporal_dim_size,
     )
     predictor = PredictorMultiSeqWrapper(predictor)
-
-    encoder.to(device)
     predictor.to(device)
-    logger.info(encoder)
     logger.info(predictor)
-
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    logger.info(f"Encoder number of parameters: {count_parameters(encoder)}")
     logger.info(f"Predictor number of parameters: {count_parameters(predictor)}")
 
     return encoder, predictor
