@@ -1,0 +1,96 @@
+# Stage B for four tactile chains and two visual/state arm streams.
+manifest: /liury/src/lry-vjepa2/data/manifests/contact_v5_4chain_20261111/episodes_4chain.jsonl
+protected_data_roots:
+  - /data/upload/recorder_1
+seed: 0
+val_ratio: 0.15
+test_ratio: 0.10
+stable_group_split: true
+require_contact: true
+min_contact_frames: 4
+min_chain_contact_frames: 1
+context: 4
+horizon: 30
+crop_size: 384
+normalize_vision: true
+visual_tubelet_size: 2
+num_workers: 3
+prefetch_factor: 1
+persistent_workers: true
+tensor_sharing_strategy: file_descriptor
+windows_per_episode: 2
+val_windows_per_episode: 2
+balance_single_dual: true
+dual_window_probability: 0.5
+task_balance_power: 0.0
+event_contact_threshold: 0.0039
+event_slip_threshold: 0.0035
+future_offsets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+visual_future_offsets: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]
+state_history_dim: 8
+state_scale: [0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.1, 30.0]
+
+tactile:
+  in_channels: 3
+  use_delta: true
+  patch_size: 16
+  img_size: [336, 224]
+  tubelet_size: 1
+  embed_dim: 384
+  depth: 6
+  num_heads: 6
+  use_rope: true
+  drop_path: 0.1
+
+encoder_training:
+  temporal_attention: per_frame_causal
+  causal_temporal_depth: 2
+  latent_spatial_grid: [7, 7]
+  latent_context_frames: 4
+  latent_mask_mode: spatial_tokens
+  latent_token_mask_ratio: 0.75
+
+model:
+  model_name: vit_base
+  patch_size: 16
+  use_rope: true
+  use_sdpa: true
+  img_temporal_dim_size: 1
+  interpolate_rope: true
+
+predictor_training:
+  vjepa_checkpoint: /liury/src/lry-vjepa2/data/model/vjepa2_1_vitb_dist_vitG_384.pt
+  max_steps: 2500
+  batch_size: 12
+  predictor_dim: 384
+  predictor_heads: 6
+  predictor_depth: 3
+  condition_depth: 2
+  num_condition_tokens: 4
+  modality_projection: mlp
+  stage_b_chain_dropout: 0.0
+  stage_b_arm_dropout: 0.0
+  drop_path: 0.05
+  lr: 0.00005
+  weight_decay: 0.05
+  warmup_steps: 200
+  min_lr_scale: 0.02
+  amp: true
+  amp_dtype: bfloat16
+  delta_loss_scale: 0.01
+  delta_direction_weight: 0.1
+  visual_delta_weight: 0.5
+  lambda_visual: 0.5
+  lambda_condition: 0.5
+  lambda_condition_diversity: 0.02
+  lambda_contact: 0.05
+  lambda_slip: 0.05
+  selection_visual_weight: 0.2
+  selection_condition_weight: 0.1
+  probe_selection_weight: 0.001
+  checkpoint_every_steps: 250
+  max_val_batches: 32
+  max_test_batches: 0
+  log_every: 20
+  early_stopping_min_steps: 1800
+  early_stopping_patience: 8

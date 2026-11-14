@@ -1,0 +1,178 @@
+# Controlled Stage-A autoresearch for context loss and mask granularity.
+#
+# The two compared runs use identical data, optimizer, schedule, and model:
+#   latent_mask_mode=future_frames   all spatial tokens of future frames masked
+#   latent_mask_mode=spatial_tokens  a random per-frame subset of future tokens
+#
+# Stage B consumes the selected Stage-A encoder and keeps the causal tactile,
+# visual, and state history path.
+manifest: /liury/src/lry-vjepa2/data/manifests/contact_v4_20261108/manifest.jsonl
+protected_data_roots:
+  - /data/upload/recorder_1
+seed: 0
+val_ratio: 0.15
+test_ratio: 0.1
+stable_group_split: true
+task_balance_power: 0.0
+output_root: /liury/src/lry-vjepa2/data/runs/tactile_contextmask_mixed_20261111
+require_contact: true
+min_contact_frames: 34
+encoder_min_contact_frames: 4
+min_hand_contact_frames: 1
+context: 4
+horizon: 30
+context_pooling: mean_max
+predict_visual: true
+visual_tubelet_size: 2
+crop_size: 384
+normalize_vision: true
+num_workers: 2
+prefetch_factor: 1
+persistent_workers: false
+tensor_sharing_strategy: file_descriptor
+windows_per_episode: 4
+val_windows_per_episode: 2
+batch_size: 4
+action_dim: 8
+state_history_dim: 8
+state_history_include_delta: false
+state_history_include_labels: false
+state_scale: [0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.1, 30.0]
+event_label_source: manifest
+event_offsets: [1, 2, 3, 4]
+planning_offsets: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+future_offsets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+visual_future_offsets: [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30]
+event_contact_threshold: 0.0039
+event_slip_threshold: 0.0035
+
+tactile:
+  in_channels: 3
+  use_delta: true
+  patch_size: 16
+  img_size: [336, 224]
+  tubelet_size: 1
+  embed_dim: 384
+  depth: 6
+  num_heads: 6
+  use_rope: true
+  drop_path: 0.1
+  input_dim: null
+  taxel_grid: null
+
+encoder_training:
+  stage: encoder
+  output: /liury/src/lry-vjepa2/data/runs/tactile_contextmask_mixed_20261111/stage_a
+  # This is only an upper bound. Early stopping decides convergence from the
+  # joint context + future relative loss and detached semantic probes.
+  max_steps: 30000
+  batch_size: 8
+  lr: 0.0001
+  weight_decay: 0.05
+  warmup_steps: 200
+  min_lr_scale: 0.02
+  amp: true
+  amp_dtype: bfloat16
+  checkpoint_every_steps: 250
+  max_val_batches: 64
+  max_test_batches: 0
+  log_every: 20
+  tensorboard: true
+  lambda_reconstruction: 0.0
+  lambda_delta: 0.0
+  lambda_variance: 0.05
+  lambda_covariance: 0.01
+  lambda_contact: 0.05
+  lambda_slip: 0.05
+  detach_probe_aux: true
+  lambda_temporal: 1.0
+  latent_self_prediction: true
+  # Mask fine encoder tokens inside every future frame. The 336x224 tactile
+  # image with patch_size=16 yields 21x14=294 tokens per hand and frame.
+  latent_mask_mode: spatial_tokens
+  latent_context_frames: 4
+  latent_future_offsets: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+  # This is a post-encoder pooled prediction target, not the ViT token grid.
+  latent_spatial_grid: [2, 2]
+  # 75% of fine tokens per future frame are replaced by mask_token; at least
+  # one fine token remains visible in every future frame and hand.
+  latent_token_mask_ratio: 0.75
+  latent_predictor_dim: 384
+  latent_predictor_depth: 2
+  latent_predictor_heads: 6
+  latent_predictor_drop_path: 0.05
+  latent_delta_scale: 0.01
+  latent_context_loss_scale: 0.01
+  # Context is an auxiliary anti-collapse objective. Equal weighting lets the
+  # encoder minimize future deltas instead of learning to predict them.
+  lambda_context_prediction: 0.1
+  lambda_latent_prediction: 1.0
+  latent_direction_weight: 0.1
+  ema_encoder: 0.999
+  temporal_change_scale: 0.05
+  probe_hidden_dim: 256
+  probe_selection_weight: 0.001
+  early_stopping_min_steps: 5000
+  early_stopping_patience: 12
+  early_stopping_min_delta: 0.00005
+  frame_offsets: [0, 1, 2, 3, 4, 9, 13, 19, 23, 29, 33]
+
+predictor_training:
+  stage: predictor
+  output: /liury/src/lry-vjepa2/data/runs/tactile_contextmask_mixed_20261111/stage_b
+  vjepa_checkpoint: /liury/src/lry-vjepa2/data/model/vjepa2_1_vitb_dist_vitG_384.pt
+  architecture: dense
+  init_from_latent_predictor: true
+  num_condition_tokens: 4
+  detach_auxiliary_paths: false
+  train_auxiliary_only: false
+  predictor_dim: 384
+  predictor_heads: 6
+  predictor_depth: 2
+  query_mode: cross_attention
+  event_head_use_context: true
+  detach_event_aux: true
+  detach_current_probe: true
+  pool_tactile_spatial: true
+  max_epochs: 30.0
+  batch_size: 16
+  lr: 0.00005
+  # Keep the Stage-A online encoder and EMA target as a stable latent space.
+  lr_encoder: 0.0
+  lr_probe: 0.0005
+  weight_decay: 0.05
+  warmup_steps: 100
+  modality_warmup_steps: 400
+  min_lr_scale: 0.02
+  ema_encoder: 0.999
+  fine_tune_encoder: true
+  freeze_predictor: false
+  residual_output: true
+  amp: true
+  amp_dtype: bfloat16
+  checkpoint_every_steps: 100
+  max_val_batches: 64
+  max_test_batches: 0
+  log_every: 20
+  early_stopping_min_steps: 2000
+  early_stopping_patience: 8
+  early_stopping_min_delta: 0.00005
+  lambda_event_tactile: 1.0
+  lambda_planning_tactile: 1.0
+  lambda_planning_visual: 1.0
+  visual_delta_weight: 1.0
+  lambda_contact: 0.0
+  lambda_slip: 0.0
+  lambda_magnitude: 0.0
+  lambda_probe_contact: 0.0
+  lambda_probe_slip: 0.0
+  lambda_condition: 0.5
+  lambda_condition_trajectory: 0.5
+  lambda_condition_diversity: 0.05
+  probe_hidden_dim: 256
+  probe_contact_pos_weight: 1.0
+  probe_slip_pos_weight: 1.0
+  delta_loss_scale: 0.001
+  delta_direction_weight: 0.1
+  drop_path: 0.05
+  tensorboard: true

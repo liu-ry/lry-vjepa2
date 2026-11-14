@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Stage A / Stage B Loss 详细说明</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: #152238;
+      background: #f4f7fb;
+      font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI",
+            "Microsoft YaHei", sans-serif;
+    }
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      padding: 10px 20px;
+      background: rgba(255, 255, 255, 0.96);
+      border-bottom: 1px solid #dbe4ef;
+      backdrop-filter: blur(8px);
+      font-size: 14px;
+    }
+    .toolbar button, .copy-formula {
+      border: 0;
+      border-radius: 7px;
+      padding: 8px 14px;
+      color: #fff;
+      background: #2563eb;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+    }
+    .toolbar button:hover, .copy-formula:hover { background: #1d4ed8; }
+    #copyStatus { color: #15803d; font-weight: 700; }
+    main {
+      max-width: 1120px;
+      margin: 24px auto 56px;
+      padding: 36px 42px 72px;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      box-shadow: 0 8px 28px rgba(15, 23, 42, 0.06);
+    }
+    h1, h2, h3 { color: #152238; line-height: 1.3; }
+    h1 { font-size: 32px; margin-top: 0; }
+    h2 {
+      margin-top: 34px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #dde4ee;
+    }
+    h3 { margin-top: 26px; font-size: 20px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 18px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid #d7e0eb;
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    th { background: #f1f5f9; text-align: left; }
+    blockquote {
+      margin: 18px 0;
+      padding: 12px 18px;
+      border-left: 4px solid #2563eb;
+      background: #f8fafc;
+      color: #475569;
+    }
+    .formula {
+      margin: 18px 0;
+      border: 1px solid #bfdbfe;
+      border-radius: 8px;
+      background: #eff6ff;
+      overflow: hidden;
+    }
+    .formula-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 7px 12px;
+      color: #475569;
+      background: #dbeafe;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .copy-formula { padding: 4px 10px; font-size: 12px; }
+    .formula pre {
+      margin: 0;
+      padding: 14px 16px;
+      overflow-x: auto;
+      color: #152238;
+      background: #eff6ff;
+    }
+    .formula code, pre code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 14px;
+    }
+    pre {
+      overflow-x: auto;
+      padding: 14px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+    }
+    code { font-family: "SFMono-Regular", Consolas, monospace; }
+  </style>
+</head>
+<body>
+<div class="toolbar">
+  <button id="copyDocument" type="button">复制全文到飞书</button>
+  <span>公式将以可编辑 LaTeX 文本块复制；“复制 LaTeX”可用于飞书原生公式。</span>
+  <span id="copyStatus"></span>
+</div>
+<main id="report-content">
+<h1>Stage A / Stage B Loss 详细说明</h1>
+<h2>当前最终训练范式</h2>
+<p>本文只说明当前保留并采用的两阶段触觉世界模型：</p>
+<ul>
+<li>Stage A：细粒度触觉 token mask + context/future latent prediction；</li>
+<li>Stage B：固定 Stage A latent space，训练因果未来预测器和 4 个 query token；</li>
+<li>Stage B 不使用未来 action 或未来 state；</li>
+<li>两个阶段都不重建原始未来触觉图像。</li>
+</ul>
+<blockquote>
+<p><strong>飞书复制说明</strong>：本文所有公式都保存在可选择、可复制的 LaTeX 文本块中。
+复制全文后，公式会以代码块形式进入飞书；如果需要飞书原生公式，可点击
+每条公式上方的“复制 LaTeX”，再粘贴到飞书公式编辑器中。</p>
+</blockquote>
+<hr/>
+<h1>一、符号约定</h1>
+<table>
+<thead>
+<tr>
+<th>符号</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>E_theta</code></td>
+<td>在线触觉编码器</td>
+</tr>
+<tr>
+<td><code>E_xi</code></td>
+<td>EMA target 触觉编码器，不接收梯度</td>
+</tr>
+<tr>
+<td><code>z_t</code></td>
+<td>第 t 帧的粗空间触觉 latent</td>
+</tr>
+<tr>
+<td><code>b</code></td>
+<td>最后一个 context 帧 latent，作为 copy-last 基准</td>
+</tr>
+<tr>
+<td><code>sg(.)</code></td>
+<td>stop-gradient</td>
+</tr>
+<tr>
+<td><code>Pool2x2(.)</code></td>
+<td>将细粒度编码 token 池化为每手 2×2 粗 latent</td>
+</tr>
+<tr>
+<td><code>normalize(.)</code></td>
+<td>对最后一维做 L2 normalization</td>
+</tr>
+<tr>
+<td><code>SmoothL1</code></td>
+<td>Huber / Smooth L1 loss</td>
+</tr>
+</tbody>
+</table>
+<p>Stage A 使用：</p>
+<pre><code class="language-text">4 个 context 帧 + 30 个 future 帧 = 34 帧
+</code></pre>
+<p>每帧每只手的触觉图像为 <code>336×224</code>，patch 为 <code>16×16</code>：</p>
+<pre><code class="language-text">21×14 = 294 个细粒度 ViT token / hand / frame
+588 个细粒度 ViT token / frame（双手）
+</code></pre>
+<p>Stage A 的未来预测目标不是 294 个细粒度 token，而是池化后的：</p>
+<pre><code class="language-text">[B, 30, 2 hands, 2×2, 384]
+</code></pre>
+<p>也就是每个未来帧、每只手预测 4 个粗空间 latent。</p>
+<hr/>
+<h1>二、Stage A Loss</h1>
+<h2>1. Context latent loss</h2>
+<p>设：</p>
+<ul>
+<li><code>z_hat_context</code>：latent predictor 输出的 context latent；</li>
+<li><code>z_target_context</code>：EMA target encoder 产生的 context latent。</li>
+</ul>
+
+<div class="formula" data-latex="L_context =
+SmoothL1(
+  z_hat_context / 0.01,
+  stopgrad(z_target_context) / 0.01;
+  beta = 0.2
+)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_context =
+SmoothL1(
+  z_hat_context / 0.01,
+  stopgrad(z_target_context) / 0.01;
+  beta = 0.2
+)
+</code></pre>
+</div>
+
+<p>作用：</p>
+<ul>
+<li>预测 4 个历史帧的粗 latent；</li>
+<li>抑制在线编码器和 target encoder 之间的表示漂移；</li>
+<li>提供稳定的历史表示；</li>
+<li>不让未来预测完全依赖当前帧 copy-last。</li>
+</ul>
+<p>当前权重：</p>
+<pre><code class="language-yaml">lambda_context_prediction: 0.1
+</code></pre>
+<p>因此 context loss 是辅助项，future loss 才是主目标。</p>
+<hr/>
+<h2>2. Future delta latent loss</h2>
+<p>Stage A 不直接回归绝对未来 latent，而是预测未来增量。</p>
+<p>设：</p>
+<ul>
+<li><code>z_hat_h(t)</code>：预测的未来触觉 latent；</li>
+<li><code>z_target_h(t)</code>：EMA target 的未来触觉 latent；</li>
+<li><code>b</code>：最后一个 context 帧 latent；</li>
+<li><code>h</code>：left/right hand。</li>
+</ul>
+
+<div class="formula" data-latex="d_hat_h(t) = z_hat_h(t) - b
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>d_hat_h(t) = z_hat_h(t) - b
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="d_star_h(t) = z_target_h(t) - b
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>d_star_h(t) = z_target_h(t) - b
+</code></pre>
+</div>
+
+<p>这样模型必须学习“触觉未来如何变化”，而不是只复制当前 latent。</p>
+<h3>2.1 Delta Smooth L1</h3>
+
+<div class="formula" data-latex="L_delta_smooth =
+SmoothL1(
+  d_hat / 0.01,
+  d_star / 0.01;
+  beta = 0.2
+)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_delta_smooth =
+SmoothL1(
+  d_hat / 0.01,
+  d_star / 0.01;
+  beta = 0.2
+)
+</code></pre>
+</div>
+
+<h3>2.2 Delta 方向 loss</h3>
+<p>除了绝对值，还约束未来变化方向：</p>
+
+<div class="formula" data-latex="L_delta_direction =
+|| normalize(d_hat) - normalize(d_star) ||_2^2
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_delta_direction =
+|| normalize(d_hat) - normalize(d_star) ||_2^2
+</code></pre>
+</div>
+
+<p>当前权重：</p>
+<pre><code class="language-yaml">latent_direction_weight: 0.1
+</code></pre>
+<p>于是：</p>
+
+<div class="formula" data-latex="L_future =
+L_delta_smooth
++ 0.1 * L_delta_direction
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_future =
+L_delta_smooth
++ 0.1 * L_delta_direction
+</code></pre>
+</div>
+
+<h3>2.3 Change weighting</h3>
+<p>目标触觉变化越大的 hand/spatial cell，权重越高：</p>
+
+<div class="formula" data-latex="w =
+1 + m / mean(m)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>w =
+1 + m / mean(m)
+</code></pre>
+</div>
+
+<p>其中：</p>
+
+<div class="formula" data-latex="m = sqrt( mean_dim( d_star^2 ) )
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>m = sqrt( mean_dim( d_star^2 ) )
+</code></pre>
+</div>
+
+<p>作用是避免明显变化的位置被大量近似静止的位置淹没。</p>
+<hr/>
+<h2>3. Variance loss</h2>
+<p>Variance loss 作用在细粒度触觉编码 token 上，防止 token 维度方差过小和表征塌缩。</p>
+
+<div class="formula" data-latex="L_var =
+mean_j max(0, 0.1 - std_j)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_var =
+mean_j max(0, 0.1 - std_j)
+</code></pre>
+</div>
+
+<p>当前权重：</p>
+<pre><code class="language-yaml">lambda_variance: 0.05
+</code></pre>
+<hr/>
+<h2>4. Covariance loss</h2>
+<p>设 <code>C</code> 为 token 特征协方差矩阵，<code>D</code> 为特征维度。</p>
+
+<div class="formula" data-latex="L_cov =
+sum_(i != j) C_ij^2 / D
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_cov =
+sum_(i != j) C_ij^2 / D
+</code></pre>
+</div>
+
+<p>作用是降低不同特征维度之间的冗余相关性。</p>
+<p>当前权重：</p>
+<pre><code class="language-yaml">lambda_covariance: 0.01
+</code></pre>
+<hr/>
+<h2>5. Contact / slip probe loss</h2>
+<p>Contact probe：</p>
+
+<div class="formula" data-latex="L_contact =
+BCEWithLogits(c_hat, c_target)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_contact =
+BCEWithLogits(c_hat, c_target)
+</code></pre>
+</div>
+
+<p>Slip probe：</p>
+
+<div class="formula" data-latex="L_slip =
+BCEWithLogits(s_hat, s_target)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_slip =
+BCEWithLogits(s_hat, s_target)
+</code></pre>
+</div>
+
+<p>当前权重：</p>
+<pre><code class="language-yaml">lambda_contact: 0.05
+lambda_slip: 0.05
+detach_probe_aux: true
+</code></pre>
+<p>由于 <code>detach_probe_aux=true</code>：</p>
+<ul>
+<li>probe 参数会通过 BCE 更新；</li>
+<li>梯度不会回流到触觉编码器；</li>
+<li>contact/slip 主要作为语义诊断，用来检查触觉 latent 是否保留接触和滑移信息。</li>
+</ul>
+<hr/>
+<h2>6. Temporal change loss</h2>
+<p>对相邻帧的池化触觉特征计算余弦变化：</p>
+
+<div class="formula" data-latex="feature_change_t =
+1 - cos(f_t, f_(t-1))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>feature_change_t =
+1 - cos(f_t, f_(t-1))
+</code></pre>
+</div>
+
+<p>由触觉形变能量构造目标变化量：</p>
+
+<div class="formula" data-latex="target_change_t =
+0.05 * clamp(pair_energy / contact_threshold, 0, 2)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>target_change_t =
+0.05 * clamp(pair_energy / contact_threshold, 0, 2)
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="L_temporal =
+SmoothL1(feature_change, stopgrad(target_change))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_temporal =
+SmoothL1(feature_change, stopgrad(target_change))
+</code></pre>
+</div>
+
+<p>当前权重：</p>
+<pre><code class="language-yaml">lambda_temporal: 1.0
+</code></pre>
+<p>该 loss 会反向传播到在线触觉编码器，使触觉 latent 的时间变化与实际触觉形变过程相关。</p>
+<hr/>
+<h2>7. Stage A 实际总 loss</h2>
+<p>当前配置关闭了 raw-frame reconstruction 和 reconstruction delta：</p>
+<pre><code class="language-yaml">lambda_reconstruction: 0.0
+lambda_delta: 0.0
+</code></pre>
+<p>因此当前实际优化目标为：</p>
+
+<div class="formula" data-latex="L_StageA =
+L_future
++ 0.1 * L_context
++ 0.05 * L_var
++ 0.01 * L_cov
++ 0.05 * L_contact
++ 0.05 * L_slip
++ 1.0 * L_temporal
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_StageA =
+L_future
++ 0.1 * L_context
++ 0.05 * L_var
++ 0.01 * L_cov
++ 0.05 * L_contact
++ 0.05 * L_slip
++ 1.0 * L_temporal
+</code></pre>
+</div>
+
+<p>各项作用：</p>
+<table>
+<thead>
+<tr>
+<th>Loss</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Future delta</td>
+<td>学习未来触觉 latent 变化</td>
+</tr>
+<tr>
+<td>Context</td>
+<td>稳定历史 latent，抑制表示漂移</td>
+</tr>
+<tr>
+<td>Variance</td>
+<td>防止 token 表征塌缩</td>
+</tr>
+<tr>
+<td>Covariance</td>
+<td>降低特征维度冗余</td>
+</tr>
+<tr>
+<td>Contact/slip probe</td>
+<td>诊断接触和滑移信息，不塑造 encoder</td>
+</tr>
+<tr>
+<td>Temporal</td>
+<td>让特征变化与实际形变能量对应</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h2>8. Stage A checkpoint selection</h2>
+<p>训练 loss 和验证选择分数不是同一个东西。</p>
+<p>Stage A 的验证选择分数为：</p>
+
+<div class="formula" data-latex="joint_relative =
+(
+  0.1 * context_relative
+  + 1.0 * future_relative
+) / 1.1
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>joint_relative =
+(
+  0.1 * context_relative
+  + 1.0 * future_relative
+) / 1.1
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="score_A =
+joint_relative
++ 0.001 * (2 - contact_AUROC - slip_AUROC)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>score_A =
+joint_relative
++ 0.001 * (2 - contact_AUROC - slip_AUROC)
+</code></pre>
+</div>
+
+<p>其中 relative loss 与 copy-last/零增量基线比较：</p>
+
+<div class="formula" data-latex="future_relative =
+(L_future + eps) / (L_copy + eps)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>future_relative =
+(L_future + eps) / (L_copy + eps)
+</code></pre>
+</div>
+
+<p><code>future_relative &lt; 1</code> 表示优于 copy-last。</p>
+<hr/>
+<h1>三、Stage B Loss</h1>
+<p>Stage B 不再使用 Stage A 的 masked context/future loss。</p>
+<p>Stage B 输入严格只有历史数据：</p>
+<pre><code class="language-text">4 × touch history
+4 × V-JEPA visual history
+4 × state history
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">future_tactile:   [B, 30, 2 hands, 1, 384]
+future_visual:    [B, 15, D_visual]
+condition_tokens: [B, 4, 384]
+</code></pre>
+<p>Stage A 的 encoder 和 EMA target 被保留：</p>
+<pre><code class="language-yaml">lr_encoder: 0.0
+fine_tune_encoder: true
+</code></pre>
+<p>因此 encoder 虽然仍存在于优化器中，但学习率为 0，实际效果是固定 Stage A latent space。</p>
+<hr/>
+<h2>9. Event / planning tactile delta loss</h2>
+<p>未来 horizon 被拆成：</p>
+<table>
+<thead>
+<tr>
+<th>区间</th>
+<th>offsets</th>
+<th style="text-align: right;">数量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>event</td>
+<td>t+1 到 t+4</td>
+<td style="text-align: right;">4</td>
+</tr>
+<tr>
+<td>planning</td>
+<td>t+5 到 t+30</td>
+<td style="text-align: right;">26</td>
+</tr>
+</tbody>
+</table>
+<p>分别计算：</p>
+
+<div class="formula" data-latex="d_hat_event = z_hat_event - b
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>d_hat_event = z_hat_event - b
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="d_star_event = z_target_event - b
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>d_star_event = z_target_event - b
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="d_hat_planning = z_hat_planning - b
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>d_hat_planning = z_hat_planning - b
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="d_star_planning = z_target_planning - b
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>d_star_planning = z_target_planning - b
+</code></pre>
+</div>
+
+<p>每个区间使用：</p>
+
+<div class="formula" data-latex="L_delta =
+SmoothL1(d_hat / 0.001, d_star / 0.001; beta = 0.2)
++ 0.1 * || normalize(d_hat) - normalize(d_star) ||_2^2
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_delta =
+SmoothL1(d_hat / 0.001, d_star / 0.001; beta = 0.2)
++ 0.1 * || normalize(d_hat) - normalize(d_star) ||_2^2
+</code></pre>
+</div>
+
+<p>当前配置：</p>
+<pre><code class="language-yaml">delta_loss_scale: 0.001
+delta_direction_weight: 0.1
+</code></pre>
+<p>按未来帧数量加权得到总触觉 loss：</p>
+
+<div class="formula" data-latex="L_tactile =
+(4 * L_event + 26 * L_planning) / 30
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_tactile =
+(4 * L_event + 26 * L_planning) / 30
+</code></pre>
+</div>
+
+<hr/>
+<h2>10. Visual latent loss</h2>
+<p>Stage B 同时预测 V-JEPA 未来视觉 latent。</p>
+<p>绝对视觉项：</p>
+
+<div class="formula" data-latex="L_visual_abs =
+MSE(normalize(z_hat_visual), normalize(z_target_visual))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_visual_abs =
+MSE(normalize(z_hat_visual), normalize(z_target_visual))
+</code></pre>
+</div>
+
+<p>视觉 delta 项：</p>
+
+<div class="formula" data-latex="L_visual_delta =
+SmoothL1(
+  (z_hat_visual - b_visual) / visual_delta_rms,
+  (z_target_visual - b_visual) / visual_delta_rms;
+  beta = 0.2
+)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_visual_delta =
+SmoothL1(
+  (z_hat_visual - b_visual) / visual_delta_rms,
+  (z_target_visual - b_visual) / visual_delta_rms;
+  beta = 0.2
+)
+</code></pre>
+</div>
+
+<p>总视觉 loss：</p>
+
+<div class="formula" data-latex="L_visual =
+L_visual_abs + 1.0 * L_visual_delta
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_visual =
+L_visual_abs + 1.0 * L_visual_delta
+</code></pre>
+</div>
+
+<p>当前权重：</p>
+<pre><code class="language-yaml">lambda_planning_visual: 1.0
+visual_delta_weight: 1.0
+</code></pre>
+<hr/>
+<h2>11. Condition / query token losses</h2>
+<p>4 个 query token 通过 cross-attention 读取：</p>
+<ul>
+<li>history tactile；</li>
+<li>history visual；</li>
+<li>history state；</li>
+<li>predicted future tactile；</li>
+<li>predicted future visual。</li>
+</ul>
+<p>每个 summary loss 都使用归一化后的 MSE：</p>
+
+<div class="formula" data-latex="L_summary =
+MSE(normalize(y_hat), normalize(y_target))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_summary =
+MSE(normalize(y_hat), normalize(y_target))
+</code></pre>
+</div>
+
+<h3>11.1 History tactile summary</h3>
+
+<div class="formula" data-latex="L_history_tactile =
+MSE(normalize(y_hat_history_tactile),
+    normalize(y_target_history_tactile))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_history_tactile =
+MSE(normalize(y_hat_history_tactile),
+    normalize(y_target_history_tactile))
+</code></pre>
+</div>
+
+<p>目标是历史触觉序列的四路统计量：</p>
+<ul>
+<li>spatial mean 的时间均值；</li>
+<li>spatial mean 的时间最大值；</li>
+<li>spatial max 的时间均值；</li>
+<li>spatial max 的时间最大值。</li>
+</ul>
+<h3>11.2 Future tactile summary</h3>
+
+<div class="formula" data-latex="L_future_tactile =
+MSE(normalize(y_hat_future_tactile),
+    normalize(y_target_future_tactile))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_future_tactile =
+MSE(normalize(y_hat_future_tactile),
+    normalize(y_target_future_tactile))
+</code></pre>
+</div>
+
+<p>目标是完整 30 帧未来触觉 latent 的四路统计量。</p>
+<h3>11.3 Full future tactile trajectory</h3>
+
+<div class="formula" data-latex="L_future_trajectory =
+MSE(normalize(z_hat_future_trajectory),
+    normalize(z_target_future_trajectory))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_future_trajectory =
+MSE(normalize(z_hat_future_trajectory),
+    normalize(z_target_future_trajectory))
+</code></pre>
+</div>
+
+<p>目标是未来 30 帧、双手的完整空间平均 latent trajectory。</p>
+<p>该项用于防止 query token 只保留摘要统计量，而丢失未来时间结构。</p>
+<h3>11.4 History / future visual summary</h3>
+
+<div class="formula" data-latex="L_history_visual =
+MSE(normalize(y_hat_history_visual),
+    normalize(y_target_history_visual))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_history_visual =
+MSE(normalize(y_hat_history_visual),
+    normalize(y_target_history_visual))
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="L_future_visual =
+MSE(normalize(y_hat_future_visual),
+    normalize(y_target_future_visual))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_future_visual =
+MSE(normalize(y_hat_future_visual),
+    normalize(y_target_future_visual))
+</code></pre>
+</div>
+
+<h3>11.5 History state summary</h3>
+
+<div class="formula" data-latex="L_history_state =
+MSE(normalize(y_hat_history_state),
+    normalize(y_target_history_state))
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_history_state =
+MSE(normalize(y_hat_history_state),
+    normalize(y_target_history_state))
+</code></pre>
+</div>
+
+<h3>11.6 Query diversity loss</h3>
+<p>对 4 个 query token 做 L2 normalization：</p>
+
+<div class="formula" data-latex="Q_hat = normalize(Q)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>Q_hat = normalize(Q)
+</code></pre>
+</div>
+
+<p>计算 token 间 cosine Gram 矩阵，并只惩罚非对角项：</p>
+
+<div class="formula" data-latex="L_query_diversity =
+mean_(i != j) (Q_hat_i dot Q_hat_j)^2
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_query_diversity =
+mean_(i != j) (Q_hat_i dot Q_hat_j)^2
+</code></pre>
+</div>
+
+<p>作用是抑制多个 query token 塌缩成相同方向。</p>
+<p>当前权重：</p>
+<pre><code class="language-yaml">lambda_condition: 0.5
+lambda_condition_trajectory: 0.5
+lambda_condition_diversity: 0.05
+</code></pre>
+<hr/>
+<h2>12. Stage B 实际总 loss</h2>
+<p>当前配置关闭以下项：</p>
+<pre><code class="language-yaml">lambda_contact: 0.0
+lambda_slip: 0.0
+lambda_magnitude: 0.0
+lambda_probe_contact: 0.0
+lambda_probe_slip: 0.0
+</code></pre>
+<p>因此当前实际优化目标为：</p>
+
+<div class="formula" data-latex="L_condition_summary =
+L_history_tactile
++ L_future_tactile
++ L_history_visual
++ L_future_visual
++ L_history_state
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_condition_summary =
+L_history_tactile
++ L_future_tactile
++ L_history_visual
++ L_future_visual
++ L_history_state
+</code></pre>
+</div>
+
+
+<div class="formula" data-latex="L_StageB =
+L_tactile
++ 1.0 * L_visual
++ 0.5 * L_condition_summary
++ 0.5 * L_future_trajectory
++ 0.05 * L_query_diversity
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_StageB =
+L_tactile
++ 1.0 * L_visual
++ 0.5 * L_condition_summary
++ 0.5 * L_future_trajectory
++ 0.05 * L_query_diversity
+</code></pre>
+</div>
+
+<p>当前不参与主优化的项：</p>
+<ul>
+<li>future contact/slip BCE；</li>
+<li>current contact/slip probe BCE；</li>
+<li>magnitude loss；</li>
+<li>单独的 event/planning absolute latent MSE。</li>
+</ul>
+<p>这些量仍会计算和记录，用于诊断、AUROC 和 checkpoint selection。</p>
+<hr/>
+<h2>13. Stage B checkpoint selection</h2>
+<p>Stage B 的验证选择分数为：</p>
+
+<div class="formula" data-latex="score_B =
+0.75 * tactile_relative
++ 0.10 * L_condition
++ 0.075 * (1 - contact_AUROC)
++ 0.075 * (1 - slip_AUROC)
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>score_B =
+0.75 * tactile_relative
++ 0.10 * L_condition
++ 0.075 * (1 - contact_AUROC)
++ 0.075 * (1 - slip_AUROC)
+</code></pre>
+</div>
+
+<p>其中：</p>
+
+<div class="formula" data-latex="L_condition =
+L_condition_summary + L_future_trajectory
+">
+<div class="formula-toolbar">
+<span>LaTeX 公式</span>
+<button class="copy-formula" type="button">复制 LaTeX</button>
+</div>
+<pre><code>L_condition =
+L_condition_summary + L_future_trajectory
+</code></pre>
+</div>
+
+<p>当前视觉 relative loss 只记录，不参与 checkpoint selection。</p>
+<hr/>
+<h1>四、梯度作用范围</h1>
+<table>
+<thead>
+<tr>
+<th>参数或模块</th>
+<th>Stage A</th>
+<th>Stage B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>在线触觉编码器</td>
+<td>更新</td>
+<td><code>lr_encoder=0</code>，不更新</td>
+</tr>
+<tr>
+<td>EMA target encoder</td>
+<td>只通过 EMA 更新</td>
+<td>固定</td>
+</tr>
+<tr>
+<td>Stage A latent predictor</td>
+<td>更新</td>
+<td>作为 Stage B predictor warm start</td>
+</tr>
+<tr>
+<td>Dense future predictor</td>
+<td>不使用</td>
+<td>更新</td>
+</tr>
+<tr>
+<td>Contact/slip probes</td>
+<td>更新，但不回传 encoder</td>
+<td>只诊断，不参与主 loss</td>
+</tr>
+<tr>
+<td>Query token 和 readout heads</td>
+<td>不使用</td>
+<td>更新</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h1>五、核心区别</h1>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>Stage A</th>
+<th>Stage B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>输入</td>
+<td>4 历史帧 + 30 未来帧的 masked tokens</td>
+<td>只用 4 帧历史</td>
+</tr>
+<tr>
+<td>预测目标</td>
+<td>30 帧粗触觉 latent</td>
+<td>30 帧触觉 latent + 15 waypoint 视觉 latent</td>
+</tr>
+<tr>
+<td>主 loss</td>
+<td>future delta + context auxiliary</td>
+<td>future tactile delta + visual + query supervision</td>
+</tr>
+<tr>
+<td>是否严格因果</td>
+<td>否，未来部分 token 在 mask 后仍可见</td>
+<td>是，严格 history-only</td>
+</tr>
+<tr>
+<td>是否重建成原始图像</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td>Query token</td>
+<td>没有</td>
+<td>4 个</td>
+</tr>
+</tbody>
+</table>
+<hr/>
+<h1>六、一句话总结</h1>
+<blockquote>
+<p>Stage A 通过局部细粒度 token mask、context 辅助、future delta、temporal
+和 anti-collapse loss 学习稳定的触觉 latent space。Stage B 固定这个 latent
+space，只使用历史 touch/vision/state 预测未来触觉与视觉 latent，并通过
+summary、完整 trajectory 和 diversity loss 训练 4 个 query token。</p>
+</blockquote>
+</main>
+<script>
+const copyButton = document.getElementById("copyDocument");
+const copyStatus = document.getElementById("copyStatus");
+
+async function copyText(text, successMessage) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+  } else {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+  copyStatus.textContent = successMessage;
+  setTimeout(() => { copyStatus.textContent = ""; }, 2500);
+}
+
+async function copyDocument() {
+  const article = document.getElementById("report-content");
+  const clone = article.cloneNode(true);
+  clone.querySelectorAll(".formula-toolbar").forEach((node) => node.remove());
+  const richHtml = '<div class="feishu-document">' + clone.innerHTML + "</div>";
+  const plainText = article.innerText;
+  try {
+    if (navigator.clipboard && window.ClipboardItem) {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/html": new Blob([richHtml], { type: "text/html" }),
+          "text/plain": new Blob([plainText], { type: "text/plain" }),
+        }),
+      ]);
+      copyStatus.textContent = "已复制，请粘贴到飞书";
+    } else {
+      const range = document.createRange();
+      range.selectNodeContents(article);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.execCommand("copy");
+      selection.removeAllRanges();
+      copyStatus.textContent = "已复制，请粘贴到飞书";
+    }
+  } catch (error) {
+    copyStatus.textContent = "自动复制失败，请使用 Ctrl+A / Ctrl+C";
+    console.error(error);
+  }
+}
+
+copyButton.addEventListener("click", copyDocument);
+document.querySelectorAll(".copy-formula").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const latex = button.closest(".formula").dataset.latex;
+    try {
+      await copyText(latex, "LaTeX 已复制");
+    } catch (error) {
+      copyStatus.textContent = "LaTeX 复制失败";
+      console.error(error);
+    }
+  });
+});
+</script>
+</body>
+</html>

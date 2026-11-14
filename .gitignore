@@ -30,3 +30,11 @@ app/vjepa_droid_v2/local/
 app/vjepa_droid_v3/local/
 app/vjepa_droid_v4/local/
 configs/local
+
+# Local datasets, pretrained weights, manifests, and experiment artifacts.
+/data/runs/
+/data/model/
+/data/manifests/
+/data/outputs/
+/data/dataset/
+/data/jepa/

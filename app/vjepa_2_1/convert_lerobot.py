@@ -1,7 +1,8 @@
-"""把 LeRobot 数据集转成训练器用的 JSONL manifest。
+"""把 LeRobot / VT-UMI / recorder 数据转成训练器用的 JSONL manifest。
 
 LeRobot 的相机/传感器 key 不固定，所以特征名必须显式指定。通过
-``LeRobotDataset`` 逐帧解码，每个 episode 写成一个 ``.npy``。
+``LeRobotDataset`` 逐帧解码，每个 episode 写成一个 ``.npy``。recorder
+格式则只生成懒加载清单，不复制原始视频。
 
 Example::
 
@@ -114,6 +115,88 @@ def convert_umi_dataset(root: str | Path, output: str | Path,
                 np.save(episode_path / f"{stem}_state.npy", state)
                 item["state"] = f"episodes/{stem}_state.npy"
             stream.write(json.dumps(item) + "\n")
+    return manifest
+
+
+def convert_recorder_dataset(root: str | Path, output: str | Path,
+                             max_episodes: Optional[int] = None,
+                             require_state: bool = True,
+                             include_invalid: bool = False) -> Path:
+    """Build a lazy manifest for the ``recorder_1`` UMI directory layout.
+
+    The recorder stores synchronized MP4/NPY streams instead of pre-converted
+    arrays. We deliberately reference those files in place: copying hundreds of
+    GB into ``TCHW`` arrays wastes disk and duplicates data that is still being
+    collected. Each camera directory with at least one tactile stream becomes a
+    sample. Left/right streams from the same episode share a ``group`` so a
+    train/validation split cannot put two hands of the same episode on opposite
+    sides.
+    """
+    root = Path(root).resolve()
+    output_path = Path(output).resolve()
+    if output_path == root or root in output_path.parents:
+        raise ValueError(
+            "recorder source is read-only; --output must be outside --root "
+            f"(root={root}, output={output_path})"
+        )
+    output_path.mkdir(parents=True, exist_ok=True)
+    excluded_parts = set() if include_invalid else {"discarded", "错误数据"}
+    manifests = [
+        path for path in sorted(root.rglob("fisheye_rgb.mp4"))
+        if not (set(path.relative_to(root).parts) & excluded_parts)
+    ]
+    if max_episodes is not None:
+        manifests = manifests[:int(max_episodes)]
+    if not manifests:
+        raise ValueError(f"no fisheye_rgb.mp4 files found under {root}")
+
+    manifest = output_path / "manifest.jsonl"
+    written = 0
+    with manifest.open("w", encoding="utf-8") as stream:
+        for number, vision_path in enumerate(manifests, start=1):
+            stream_dir = vision_path.parent
+            tactile_paths = [
+                path for path in (stream_dir / "tactile_left.mp4",
+                                  stream_dir / "tactile_right.mp4")
+                if path.is_file()
+            ]
+            if not tactile_paths:
+                continue
+            episode_dir = stream_dir.parent
+            state_paths = [
+                path for path in (stream_dir / "vio_pose.npy",
+                                  stream_dir / "gripper_pose.npy")
+                if path.is_file()
+            ]
+            if require_state and len(state_paths) != 2:
+                continue
+            task_dir = (
+                episode_dir.parent.parent
+                if episode_dir.parent.name == "vitai_umi_data"
+                else episode_dir.parent
+            )
+            record = {
+                "vision": str(vision_path),
+                "tactile": [str(path) for path in tactile_paths],
+                "tactile_sides": [
+                    "left" if path.name == "tactile_left.mp4" else "right"
+                    for path in tactile_paths
+                ],
+                "group": str(episode_dir.relative_to(root)),
+                "stream": str(stream_dir.relative_to(root)),
+                "task": task_dir.name,
+                "episode": episode_dir.name,
+            }
+            if len(state_paths) == 2:
+                record["state"] = [str(path) for path in state_paths]
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            written += 1
+            if number == 1 or number % 500 == 0:
+                print(f"[convert] scanned {number}/{len(manifests)} camera streams", flush=True)
+
+    if written == 0:
+        raise ValueError(f"no tactile streams found beside videos under {root}")
+    print(f"[convert] wrote {written} tactile camera stream(s)", flush=True)
     return manifest
 
 
@@ -241,8 +324,8 @@ def convert_dataset(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--format", choices=("lerobot", "umi"), default="lerobot",
-                        help="输入格式；VT-UMI 数据使用 umi")
+    parser.add_argument("--format", choices=("lerobot", "umi", "recorder"), default="lerobot",
+                        help="输入格式；VT-UMI 使用 umi，批量采集目录使用 recorder")
     parser.add_argument("--repo-id", help="LeRobot 仓库 id，例如 user/dataset")
     parser.add_argument("--root", default=None, help="本地 LeRobot 数据集根目录/缓存")
     parser.add_argument("--vision-key", default=None, help="相机特征 key (LeRobot)")
@@ -253,12 +336,24 @@ def main() -> None:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--include-state", action="store_true",
                         help="UMI: 拼接 left_hand/vio_pose.npy + gripper.npy 作为 state")
+    parser.add_argument("--allow-missing-state", action="store_true",
+                        help="recorder: 保留没有完整 pose+gripper 的流")
+    parser.add_argument("--include-invalid", action="store_true",
+                        help="recorder: 保留 discarded / 错误数据 目录")
     args = parser.parse_args()
     if args.format == "umi":
         if not args.root:
             parser.error("--format umi requires --root DATASET_ROOT")
         manifest = convert_umi_dataset(args.root, args.output, args.max_episodes,
                                        args.include_state)
+    elif args.format == "recorder":
+        if not args.root:
+            parser.error("--format recorder requires --root DATASET_ROOT")
+        manifest = convert_recorder_dataset(
+            args.root, args.output, args.max_episodes,
+            require_state=not args.allow_missing_state,
+            include_invalid=args.include_invalid,
+        )
     else:
         if not args.repo_id:
             parser.error("--format lerobot requires --repo-id")

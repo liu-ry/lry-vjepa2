@@ -99,6 +99,21 @@ class TactileEncoder(nn.Module):
             self.input_dim = None
 
         grid_h = (self.img_size[0] // patch_size) if self.img_size is not None else 14
+        grid_w = (self.img_size[1] // patch_size) if self.img_size is not None else 14
+        self.max_time_patches = max(1, (int(num_frames) + tubelet_size - 1) // tubelet_size)
+        self.max_spatial_tokens = max(1, grid_h * grid_w)
+        self.mask_token = nn.Parameter(
+            torch.randn(1, 1, embed_dim) * 0.02
+        )
+        # RoPE 只旋转 Q/K。若 patch token 本身在初始化时几乎相同，全局注意
+        # 力会先把它们平均掉，后续再训练也很难恢复空间差异。显式的加性位置
+        # 编码在第一个 block 之前打破这种对称性。
+        self.time_pos = nn.Parameter(
+            torch.randn(1, self.max_time_patches, embed_dim) * 0.02
+        )
+        self.spatial_pos = nn.Parameter(
+            torch.randn(1, self.max_spatial_tokens, embed_dim) * 0.02
+        )
         dpr = torch.linspace(0, drop_path, depth).tolist()
         self.blocks = nn.ModuleList(
             [
@@ -161,12 +176,38 @@ class TactileEncoder(nn.Module):
         height, width = self.img_size
         return x.view(batch, time, channels, height, width).permute(0, 2, 1, 3, 4)
 
+    @staticmethod
+    def _fit_pos(table: torch.Tensor, count: int) -> torch.Tensor:
+        if count <= table.shape[1]:
+            return table[:, :count]
+        return F.interpolate(
+            table.transpose(1, 2), size=count, mode="linear", align_corners=False
+        ).transpose(1, 2)
+
+    def _add_positions(self, tokens: torch.Tensor, time: int,
+                       height: int, width: int) -> torch.Tensor:
+        batch, count, channels = tokens.shape
+        per_frame = height * width
+        if count != time * per_frame:
+            raise ValueError(
+                f"token count {count} does not match time*spatial={time * per_frame}"
+            )
+        tokens = tokens.view(batch, time, per_frame, channels)
+        spatial = self._fit_pos(self.spatial_pos, per_frame).view(1, 1, per_frame, channels)
+        temporal = self._fit_pos(self.time_pos, time).view(1, time, 1, channels)
+        return (tokens + spatial + temporal).view(batch, count, channels)
+
     def _run_blocks(self, tokens: torch.Tensor, time: int, height: int, width: int) -> torch.Tensor:
+        tokens = self._add_positions(tokens, time, height, width)
         for block in self.blocks:
             tokens, _ = block(tokens, T=time, H_patches=height, W_patches=width)
         return self.norm(tokens)
 
-    def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
+    def _encode_image(
+        self,
+        x: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if self.patch_embed is None:
             raise ValueError("vector tactile encoder received image input")
         if x.ndim == 4:
@@ -190,6 +231,24 @@ class TactileEncoder(nn.Module):
         tokens = self.patch_embed(x)
         time_out = time // self.tubelet_size
         height_p, width_p = height // self.patch_size, width // self.patch_size
+        if token_mask is not None:
+            if token_mask.ndim == 2 and token_mask.shape == (x.shape[0], height_p * width_p):
+                token_mask = token_mask[:, None].expand(
+                    -1, time_out, -1
+                )
+            if token_mask.shape != (x.shape[0], time_out, height_p * width_p):
+                raise ValueError(
+                    "token_mask must be [B,N] or [B,T,N] with "
+                    f"N={height_p * width_p}, got {tuple(token_mask.shape)}"
+                )
+            token_mask = token_mask.to(
+                device=tokens.device, dtype=torch.bool
+            ).reshape(x.shape[0], time_out * height_p * width_p)
+            tokens = torch.where(
+                token_mask[..., None],
+                self.mask_token.to(dtype=tokens.dtype),
+                tokens,
+            )
         tokens = self._run_blocks(tokens, time_out, height_p, width_p)
         return tokens.view(x.shape[0], time_out, height_p * width_p, self.embed_dim)
 
@@ -211,7 +270,13 @@ class TactileEncoder(nn.Module):
         tokens = self._run_blocks(tokens, time_out, 1, 1)
         return tokens.view(batch, time_out, 1, self.embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if token_mask is not None and x.ndim not in (4, 5):
+            raise ValueError("token masking is only supported for image tactile input")
         if x.ndim == 3 and self.taxel_grid is not None:
             batch, time, feat = x.shape
             grid_h, grid_w = self.taxel_grid
@@ -221,7 +286,7 @@ class TactileEncoder(nn.Module):
                 )
             x = x.view(batch, time, 1, grid_h, grid_w)
         if x.ndim in (4, 5):
-            return self._encode_image(x)
+            return self._encode_image(x, token_mask=token_mask)
         if x.ndim == 3:
             return self._encode_vector(x)
         raise ValueError(f"expected [B,T,F], [B,T,C,H,W], or [B,C,H,W], got {tuple(x.shape)}")
