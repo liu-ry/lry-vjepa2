@@ -3,6 +3,8 @@ manifest: /liury/src/lry-vjepa2/data/manifests/contact_v5_4chain_20261111/episod
 protected_data_roots:
   - /data/upload/recorder_1
 seed: 0
+# Keep the data partition fixed when training multiple model seeds.
+split_seed: 0
 val_ratio: 0.15
 test_ratio: 0.10
 stable_group_split: true
@@ -17,7 +19,7 @@ visual_tubelet_size: 2
 num_workers: 3
 prefetch_factor: 1
 persistent_workers: true
-tensor_sharing_strategy: file_descriptor
+tensor_sharing_strategy: file_system
 windows_per_episode: 2
 val_windows_per_episode: 2
 balance_single_dual: true
@@ -60,8 +62,21 @@ model:
 
 predictor_training:
   vjepa_checkpoint: /liury/src/lry-vjepa2/data/model/vjepa2_1_vitb_dist_vitG_384.pt
-  max_steps: 2500
+  max_steps: 4000
   batch_size: 12
+  # This predictor forecasts future tactile/visual latents only. Actions are
+  # neither inputs nor outputs.
+  # Reuse the same absolute tactile time slots that Stage A trained. The
+  # legacy "reindexed_frames" mode encoded future frames as positions 0..29.
+  target_future_mode: absolute_full_clip
+  # "online" is useful when a masked Stage-A objective leaves the EMA target
+  # in a visibly different latent space.
+  target_encoder_source: ema
+  use_visual_history: true
+  use_state_history: true
+  # Select checkpoints by the target task. Visual/query losses keep training
+  # but no longer decide the tactile best checkpoint.
+  selection_mode: tactile
   predictor_dim: 384
   predictor_heads: 6
   predictor_depth: 3
@@ -89,8 +104,8 @@ predictor_training:
   selection_condition_weight: 0.1
   probe_selection_weight: 0.001
   checkpoint_every_steps: 250
-  max_val_batches: 32
+  max_val_batches: 64
   max_test_batches: 0
   log_every: 20
-  early_stopping_min_steps: 1800
+  early_stopping_min_steps: 3000
   early_stopping_patience: 8

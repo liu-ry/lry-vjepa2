@@ -3,6 +3,8 @@ manifest: /liury/src/lry-vjepa2/data/manifests/contact_v5_4chain_20261111/chains
 protected_data_roots:
   - /data/upload/recorder_1
 seed: 0
+# Keep the data partition fixed when training multiple model seeds.
+split_seed: 0
 val_ratio: 0.15
 test_ratio: 0.10
 stable_group_split: true
@@ -17,7 +19,7 @@ normalize_vision: true
 num_workers: 4
 prefetch_factor: 1
 persistent_workers: true
-tensor_sharing_strategy: file_descriptor
+tensor_sharing_strategy: file_system
 windows_per_episode: 2
 val_windows_per_episode: 1
 task_balance_power: 0.0
@@ -47,6 +49,9 @@ encoder_training:
   latent_context_frames: 4
   latent_mask_mode: future_frames
   latent_token_mask_ratio: 0.75
+  # Used only by stage_a_objective=masked_encoding. Keeping some unmasked
+  # batches avoids a train/inference mismatch when Stage B receives full context.
+  masked_encoding_probability: 0.5
   latent_predictor_dim: 384
   latent_predictor_depth: 2
   latent_predictor_heads: 6
@@ -74,9 +79,9 @@ encoder_training:
   amp: true
   amp_dtype: bfloat16
   checkpoint_every_steps: 250
-  max_val_batches: 32
+  max_val_batches: 64
   max_test_batches: 0
   log_every: 20
-  early_stopping_min_steps: 3500
-  early_stopping_patience: 8
+  early_stopping_min_steps: 7000
+  early_stopping_patience: 4
   early_stopping_min_delta: 0.00005

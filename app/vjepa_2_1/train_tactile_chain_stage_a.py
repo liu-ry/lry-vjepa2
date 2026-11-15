@@ -218,9 +218,13 @@ class FrameQueryTokenPredictor(nn.Module):
             need_weights=False,
         )
         attended = self.cross_norm(queries + attended)
-        output = self.head(
+        residual = self.head(
             attended[:, :, None] + self.spatial_embedding
-        ) + base_tokens[:, None]
+        )
+        if base_tokens.ndim == 4:
+            output = residual + base_tokens[:, target_positions]
+        else:
+            output = residual + base_tokens[:, None]
         context_count = len(context_indices)
         return {
             "context_tactile": output[:, :context_count],
@@ -280,6 +284,7 @@ class ChainStageAModule(nn.Module):
             "future_forecast",
             "future_sparse",
             "clip_masked",
+            "masked_encoding",
         ):
             raise ValueError(
                 "unsupported Stage-A objective"
@@ -297,6 +302,9 @@ class ChainStageAModule(nn.Module):
                 "latent_mask_mode must be 'spatial_tokens' or 'future_frames'"
             )
         self.mask_ratio = float(section.get("latent_token_mask_ratio", 0.75))
+        self.masked_encoding_probability = float(
+            section.get("masked_encoding_probability", 0.5)
+        )
         self.predictor = FrameQueryTokenPredictor(
             dim=embed_dim,
             hidden=int(section.get("latent_predictor_dim", embed_dim)),
@@ -335,6 +343,24 @@ class ChainStageAModule(nn.Module):
         mask = torch.zeros(
             batch, frames, spatial, device=self.device_name, dtype=torch.bool
         )
+        if self.objective == "masked_encoding":
+            if torch.rand((), device=self.device_name) >= (
+                self.masked_encoding_probability
+            ):
+                return mask
+            mask = (
+                torch.rand(
+                    batch,
+                    frames,
+                    spatial,
+                    device=self.device_name,
+                )
+                < self.mask_ratio
+            )
+            # Keep one visible anchor in every frame so the encoder always
+            # receives direct evidence about the frame it is encoding.
+            mask[..., 0] = False
+            return mask
         if self.objective == "clip_masked":
             height, width = 21, 14
             if spatial != height * width:
@@ -446,7 +472,9 @@ class ChainStageAModule(nn.Module):
                 target_fine = self.encoder_target(clip)
             online, online_valid = self._pool_target(online_fine, ~mask)
             target, _ = self._pool_target(target_fine)
-            if self.objective == "future_sparse":
+            if self.objective == "masked_encoding":
+                future_indices = []
+            elif self.objective == "future_sparse":
                 future_indices = [
                     self.context_count + offset - 1
                     for offset in self.sparse_future_offsets
@@ -459,16 +487,48 @@ class ChainStageAModule(nn.Module):
                 online,
                 memory_mask=online_valid,
                 frame_indices=list(range(frames)),
-                context_indices=list(range(self.context_count)),
+                context_indices=(
+                    list(range(frames))
+                    if self.objective == "masked_encoding"
+                    else list(range(self.context_count))
+                ),
                 future_indices=future_indices,
-                base_tokens=online[:, self.context_count - 1],
+                base_tokens=(
+                    online
+                    if self.objective == "masked_encoding"
+                    else online[:, self.context_count - 1]
+                ),
             )
-            context_loss, context_copy, context_cos = _normalized_context_latent_loss(
-                prediction["context_tactile"].unsqueeze(2),
-                target[:, : self.context_count].unsqueeze(2),
-                scale=float(self.section.get("latent_context_loss_scale", 0.01)),
-            )
-            if self.objective == "clip_masked":
+            if self.objective == "masked_encoding":
+                future_loss, future_copy, context_cos = (
+                    _normalized_context_latent_loss(
+                        prediction["context_tactile"].unsqueeze(2),
+                        target.unsqueeze(2),
+                        scale=float(
+                            self.section.get(
+                                "latent_context_loss_scale", 0.01
+                            )
+                        ),
+                    )
+                )
+                context_loss = future_loss
+                context_copy = future_copy
+                delta_rms = (
+                    prediction["context_tactile"] - target
+                ).square().mean().sqrt()
+            else:
+                context_loss, context_copy, context_cos = (
+                    _normalized_context_latent_loss(
+                        prediction["context_tactile"].unsqueeze(2),
+                        target[:, : self.context_count].unsqueeze(2),
+                        scale=float(
+                            self.section.get(
+                                "latent_context_loss_scale", 0.01
+                            )
+                        ),
+                    )
+                )
+            if self.objective in ("clip_masked", "masked_encoding"):
                 prediction_all = torch.cat(
                     (
                         prediction["context_tactile"],
@@ -476,18 +536,21 @@ class ChainStageAModule(nn.Module):
                     ),
                     dim=1,
                 )
-                future_loss, future_copy, _ = (
-                    _normalized_context_latent_loss(
-                        prediction_all.unsqueeze(2),
-                        target.unsqueeze(2),
-                        scale=float(
-                            self.section.get("latent_clip_loss_scale", 0.01)
-                        ),
+                if self.objective == "clip_masked":
+                    future_loss, future_copy, _ = (
+                        _normalized_context_latent_loss(
+                            prediction_all.unsqueeze(2),
+                            target.unsqueeze(2),
+                            scale=float(
+                                self.section.get(
+                                    "latent_clip_loss_scale", 0.01
+                                )
+                            ),
+                        )
                     )
-                )
-                delta_rms = (
-                    prediction_all - target
-                ).square().mean().sqrt()
+                    delta_rms = (
+                        prediction_all - target
+                    ).square().mean().sqrt()
             else:
                 selected_indices = (
                     future_indices
@@ -574,12 +637,25 @@ class ChainStageAModule(nn.Module):
             "delta_rms": delta_rms.detach(),
         }
         if not self.training:
+            future_slice = slice(
+                self.context_count
+                if self.objective != "masked_encoding"
+                else 0,
+                None,
+            )
             self._last_diagnostics = {
                 "predicted_future": (
-                    prediction["future_tactile"].detach().float().cpu()
+                    (
+                        prediction["future_tactile"]
+                        if self.objective != "masked_encoding"
+                        else prediction["context_tactile"][:, future_slice]
+                    )
+                    .detach()
+                    .float()
+                    .cpu()
                 ),
                 "target_future": (
-                    target[:, self.context_count :].detach().float().cpu()
+                    target[:, future_slice].detach().float().cpu()
                 ),
                 "base": (
                     online[:, self.context_count - 1].detach().float().cpu()
@@ -636,7 +712,7 @@ def build_loaders(cfg, *, batch_size, rank, world_size):
         items,
         val_ratio=float(cfg.get("val_ratio", 0.15)),
         test_ratio=float(cfg.get("test_ratio", 0.1)),
-        seed=int(cfg.get("seed", 0)),
+        seed=int(cfg.get("split_seed", cfg.get("seed", 0))),
         stable=bool(cfg.get("stable_group_split", True)),
     )
     def make(indices, windows, random_crop):
@@ -738,12 +814,23 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument(
+        "--sharing-strategy",
+        choices=("file_system", "file_descriptor"),
+        default=None,
+    )
+    parser.add_argument(
         "--horizon",
         type=int,
         default=None,
         help="Fixed number of consecutive future frames to forecast.",
     )
     parser.add_argument("--early-min-steps", type=int, default=None)
+    parser.add_argument("--max-test-batches", type=int, default=None)
+    parser.add_argument(
+        "--masked-encoding-probability",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--attention", choices=("per_frame_causal", "full_clip_bidirectional"), default=None)
     parser.add_argument("--target-grid", default=None, help="HxW, for example 2x2 or 21x14")
@@ -755,9 +842,17 @@ def main():
     )
     parser.add_argument(
         "--objective",
-        choices=("future_forecast", "future_sparse", "clip_masked"),
+        choices=(
+            "future_forecast",
+            "future_sparse",
+            "clip_masked",
+            "masked_encoding",
+        ),
         default=None,
-        help="Use fixed-horizon forecasting or V-JEPA-style whole-clip masking",
+        help=(
+            "Use fixed-horizon forecasting, whole-clip masking, or "
+            "same-frame masked encoding"
+        ),
     )
     parser.add_argument(
         "--future-offsets",
@@ -788,6 +883,8 @@ def main():
         cfg["seed"] = int(args.seed)
     if args.num_workers is not None:
         cfg["num_workers"] = int(args.num_workers)
+    if args.sharing_strategy is not None:
+        cfg["tensor_sharing_strategy"] = args.sharing_strategy
     if args.horizon is not None:
         if args.horizon <= 0:
             parser.error("--horizon must be positive")
@@ -795,6 +892,18 @@ def main():
     if args.early_min_steps is not None:
         cfg["encoder_training"]["early_stopping_min_steps"] = int(
             args.early_min_steps
+        )
+    if args.max_test_batches is not None:
+        cfg["encoder_training"]["max_test_batches"] = int(
+            args.max_test_batches
+        )
+    if args.masked_encoding_probability is not None:
+        if not 0.0 <= args.masked_encoding_probability <= 1.0:
+            parser.error(
+                "--masked-encoding-probability must be in [0, 1]"
+            )
+        cfg["encoder_training"]["masked_encoding_probability"] = float(
+            args.masked_encoding_probability
         )
     if args.patience is not None:
         cfg["encoder_training"]["early_stopping_patience"] = int(

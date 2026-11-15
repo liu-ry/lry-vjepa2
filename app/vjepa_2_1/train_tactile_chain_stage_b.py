@@ -116,6 +116,22 @@ def _encode_chains(
     return _pool_chain_tokens(tokens, source_grid, target_grid)
 
 
+def _encode_full_chains(
+    encoder: nn.Module,
+    clip: torch.Tensor,
+    source_grid: tuple[int, int],
+    target_grid: tuple[int, int],
+) -> torch.Tensor:
+    """Encode each complete chain so targets keep their absolute time slots."""
+    return _encode_chains(
+        encoder,
+        clip,
+        list(range(clip.shape[2])),
+        source_grid,
+        target_grid,
+    )
+
+
 def _align_temporal_embedding(
     state: dict[str, torch.Tensor],
     reference: dict[str, torch.Tensor],
@@ -177,7 +193,7 @@ def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
         items,
         val_ratio=float(cfg.get("val_ratio", 0.15)),
         test_ratio=float(cfg.get("test_ratio", 0.1)),
-        seed=int(cfg.get("seed", 0)),
+        seed=int(cfg.get("split_seed", cfg.get("seed", 0))),
         stable=bool(cfg.get("stable_group_split", True)),
     )
 
@@ -305,6 +321,39 @@ class ChainStageB:
         )
         self.spatial_tokens = self.latent_grid[0] * self.latent_grid[1]
         self.embed_dim = int(cfg["tactile"].get("embed_dim", 384))
+        self.target_future_mode = str(
+            self.section.get(
+                "target_future_mode", "absolute_full_clip"
+            )
+        ).lower()
+        if self.target_future_mode not in (
+            "absolute_full_clip",
+            "reindexed_frames",
+        ):
+            raise ValueError(
+                "target_future_mode must be 'absolute_full_clip' or "
+                "'reindexed_frames'"
+            )
+        self.target_encoder_source = str(
+            self.section.get("target_encoder_source", "ema")
+        ).lower()
+        if self.target_encoder_source not in ("ema", "online"):
+            raise ValueError(
+                "target_encoder_source must be 'ema' or 'online'"
+            )
+        self.use_visual_history = bool(
+            self.section.get("use_visual_history", True)
+        )
+        self.use_state_history = bool(
+            self.section.get("use_state_history", True)
+        )
+        self.selection_mode = str(
+            self.section.get("selection_mode", "composite")
+        ).lower()
+        if self.selection_mode not in ("composite", "tactile"):
+            raise ValueError(
+                "selection_mode must be 'composite' or 'tactile'"
+            )
 
         state = torch.load(encoder_path, map_location=device, weights_only=False)
         if "encoder" not in state:
@@ -332,7 +381,11 @@ class ChainStageB:
         )
         self.encoder_target.load_state_dict(
             _align_temporal_embedding(
-                state.get("encoder_target", state["encoder"]),
+                (
+                    state["encoder"]
+                    if self.target_encoder_source == "online"
+                    else state.get("encoder_target", state["encoder"])
+                ),
                 self.encoder_target.state_dict(),
             )
         )
@@ -425,13 +478,29 @@ class ChainStageB:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         video = batch["vision_arms"].to(self.device, non_blocking=True)
         batch_size, arms, time, channels, height, width = video.shape
+        tubelet = int(self.cfg.get("visual_tubelet_size", 2))
+        steps = time // tubelet
+        context_steps = self.context // tubelet
+        if not self.use_visual_history:
+            zeros = torch.zeros(
+                batch_size,
+                arms,
+                self.visual_dim,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            return (
+                zeros[:, :, None].expand(-1, -1, context_steps, -1),
+                zeros[:, :, None].expand(
+                    -1, -1, len(self.visual_future_offsets), -1
+                ),
+                zeros[:, :, None].expand(-1, -1, context_steps, -1),
+            )
         flat = _prepare_visual_gpu(
             video.reshape(batch_size * arms, time, channels, height, width),
             int(self.cfg.get("crop_size", 384)),
         )
         flat = flat.permute(0, 2, 1, 3, 4).contiguous()
-        tubelet = int(self.cfg.get("visual_tubelet_size", 2))
-        steps = time // tubelet
         with torch.no_grad():
             tokens = _visual_tokens(
                 _run_visual(self.visual, flat),
@@ -441,7 +510,6 @@ class ChainStageB:
         tokens = tokens.reshape(
             batch_size, arms, steps, tokens.shape[-2], tokens.shape[-1]
         )
-        context_steps = self.context // tubelet
         context = tokens[:, :, :context_steps].mean(dim=-2)
         future_indices = [
             context_steps + offset // tubelet - 1
@@ -470,6 +538,8 @@ class ChainStageB:
     def _state_history(self, batch: dict) -> torch.Tensor:
         state = batch["state_arms"].to(self.device, non_blocking=True).float()
         state = state[:, :, : self.context]
+        if not self.use_state_history:
+            return torch.zeros_like(state)
         return state / self.state_scale
 
     def _probe_losses(
@@ -555,20 +625,30 @@ class ChainStageB:
                 self.latent_grid,
             )
             with torch.no_grad():
-                target_context = _encode_chains(
-                    self.encoder_target,
-                    clip,
-                    context_indices,
-                    self.source_grid,
-                    self.latent_grid,
-                )
-                target_future = _encode_chains(
-                    self.encoder_target,
-                    clip,
-                    future_indices,
-                    self.source_grid,
-                    self.latent_grid,
-                )
+                if self.target_future_mode == "absolute_full_clip":
+                    target_all = _encode_full_chains(
+                        self.encoder_target,
+                        clip,
+                        self.source_grid,
+                        self.latent_grid,
+                    )
+                    target_context = target_all[:, :, : self.context]
+                    target_future = target_all[:, :, future_indices]
+                else:
+                    target_context = _encode_chains(
+                        self.encoder_target,
+                        clip,
+                        context_indices,
+                        self.source_grid,
+                        self.latent_grid,
+                    )
+                    target_future = _encode_chains(
+                        self.encoder_target,
+                        clip,
+                        future_indices,
+                        self.source_grid,
+                        self.latent_grid,
+                    )
                 visual_context, visual_target, visual_context_tokens = (
                     self._encode_visual(batch)
                 )
@@ -760,13 +840,16 @@ class ChainStageB:
         )
         single_arm = (arm_valid.sum(dim=1) == 1).float().mean()
         dual_arm = (arm_valid.sum(dim=1) == 2).float().mean()
-        selection = (
-            relative
-            + float(self.section.get("selection_visual_weight", 0.2))
-            * visual_relative
-            + float(self.section.get("selection_condition_weight", 0.1))
-            * float(condition_summary_loss.detach())
-            + float(self.section.get("probe_selection_weight", 0.001))
+        selection = relative
+        if self.selection_mode == "composite":
+            selection += (
+                float(self.section.get("selection_visual_weight", 0.2))
+                * visual_relative
+                + float(self.section.get("selection_condition_weight", 0.1))
+                * float(condition_summary_loss.detach())
+            )
+        selection += (
+            float(self.section.get("probe_selection_weight", 0.001))
             * (2 - contact_auc - slip_auc)
         )
         metrics = {
@@ -796,6 +879,9 @@ class ChainStageB:
             "single_arm_rate": float(single_arm),
             "dual_arm_rate": float(dual_arm),
             "selection_loss": selection,
+            "selection_mode_tactile": float(
+                self.selection_mode == "tactile"
+            ),
         }
         if not train:
             self._eval_features = {
@@ -878,12 +964,35 @@ def main() -> None:
     parser.add_argument("--arm-dropout", type=float, default=None)
     parser.add_argument("--delta-scale", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--sharing-strategy",
+        choices=("file_system", "file_descriptor"),
+        default=None,
+    )
     parser.add_argument("--early-min-steps", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--reset-best", action="store_true")
     parser.add_argument("--test-batches", type=int, default=None)
+    parser.add_argument("--max-test-batches", type=int, default=None)
+    parser.add_argument("--max-val-batches", type=int, default=None)
+    parser.add_argument(
+        "--target-future-mode",
+        choices=("absolute_full_clip", "reindexed_frames"),
+        default=None,
+    )
+    parser.add_argument(
+        "--target-encoder-source",
+        choices=("ema", "online"),
+        default=None,
+    )
+    parser.add_argument("--tactile-only", action="store_true")
+    parser.add_argument(
+        "--selection-mode",
+        choices=("composite", "tactile"),
+        default=None,
+    )
     args = parser.parse_args()
     cfg = _load_config(args.config)
     if args.batch_size:
@@ -922,6 +1031,8 @@ def main() -> None:
         cfg["predictor_training"]["delta_loss_scale"] = args.delta_scale
     if args.num_workers is not None:
         cfg["num_workers"] = int(args.num_workers)
+    if args.sharing_strategy is not None:
+        cfg["tensor_sharing_strategy"] = args.sharing_strategy
     if args.early_min_steps is not None:
         cfg["predictor_training"]["early_stopping_min_steps"] = int(
             args.early_min_steps
@@ -930,6 +1041,27 @@ def main() -> None:
         cfg["predictor_training"]["early_stopping_patience"] = int(
             args.patience
         )
+    if args.max_test_batches is not None:
+        cfg["predictor_training"]["max_test_batches"] = int(
+            args.max_test_batches
+        )
+    if args.max_val_batches is not None:
+        cfg["predictor_training"]["max_val_batches"] = int(
+            args.max_val_batches
+        )
+    if args.target_future_mode is not None:
+        cfg["predictor_training"]["target_future_mode"] = (
+            args.target_future_mode
+        )
+    if args.target_encoder_source is not None:
+        cfg["predictor_training"]["target_encoder_source"] = (
+            args.target_encoder_source
+        )
+    if args.tactile_only:
+        cfg["predictor_training"]["use_visual_history"] = False
+        cfg["predictor_training"]["use_state_history"] = False
+    if args.selection_mode is not None:
+        cfg["predictor_training"]["selection_mode"] = args.selection_mode
     height, width = args.latent_grid.lower().split("x", 1)
     grid = (int(height), int(width))
     rank, world_size, device = setup_distributed()

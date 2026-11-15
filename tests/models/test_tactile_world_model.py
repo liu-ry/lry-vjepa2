@@ -29,6 +29,11 @@ from app.vjepa_2_1.train_tactile_two_stage import (
 )
 from app.vjepa_2_1.train_tactile_chain_stage_b import (
     _align_temporal_embedding,
+    _encode_chains,
+    _encode_full_chains,
+)
+from app.vjepa_2_1.train_tactile_chain_stage_a import (
+    ChainTactileEncoder,
 )
 
 
@@ -94,6 +99,28 @@ def test_tactile_encoder_accepts_fine_token_mask():
     output = encoder(torch.randn(2, 3, 8, 8), token_mask=mask)
     assert output.shape == (2, 1, 4, 32)
     assert torch.isfinite(output).all()
+
+
+def test_chain_tactile_encoder_prefix_is_causally_invariant():
+    torch.manual_seed(0)
+    encoder = ChainTactileEncoder(
+        attention_mode="per_frame_causal",
+        embed_dim=16,
+        depth=1,
+        heads=4,
+        image_size=(32, 32),
+        max_time=6,
+        causal_depth=1,
+        drop_path=0.0,
+    ).eval()
+    clip = torch.randn(1, 4, 6, 32, 32)
+    changed_future = clip.clone()
+    changed_future[:, 2:] = torch.randn_like(changed_future[:, 2:])
+    with torch.no_grad():
+        original = encoder(clip)
+        altered = encoder(changed_future)
+    assert torch.allclose(original[:, :2], altered[:, :2], atol=1e-6)
+    assert not torch.allclose(original[:, 2:], altered[:, 2:], atol=1e-6)
 
 
 def test_tactile_vector_and_taxel_encoders():
@@ -175,6 +202,8 @@ def test_chain_predictor_mlp_projection_and_query_gradients():
     assert tactile.grad is not None
     assert model.condition_query.grad is not None
     assert output["future_tactile"].shape == (2, 4, 3, 4, 16)
+    assert "action" not in output
+    assert not any("action" in name for name, _ in model.named_parameters())
 
 
 def test_normed_projection_and_short_horizon_encoder_alignment():
@@ -202,6 +231,30 @@ def test_normed_projection_and_short_horizon_encoder_alignment():
     assert aligned.shape == (1, 34, 2)
     assert torch.equal(aligned[:, :5], source[key])
     assert torch.equal(aligned[:, 5:], source[key][:, -1:].expand(-1, 29, -1))
+
+
+def test_full_clip_target_preserves_causal_context_prefix():
+    torch.manual_seed(1)
+    encoder = ChainTactileEncoder(
+        attention_mode="per_frame_causal",
+        embed_dim=16,
+        depth=1,
+        heads=4,
+        image_size=(32, 32),
+        max_time=8,
+        causal_depth=1,
+        drop_path=0.0,
+    ).eval()
+    clip = torch.randn(2, 3, 8, 6, 32, 32)
+    with torch.no_grad():
+        full = _encode_full_chains(
+            encoder, clip, (2, 2), (2, 2)
+        )
+        prefix = _encode_chains(
+            encoder, clip, [0, 1, 2, 3], (2, 2), (2, 2)
+        )
+    assert full.shape == (2, 3, 8, 4, 16)
+    assert torch.allclose(full[:, :, :4], prefix, atol=1e-6)
 
 
 def test_dense_predictor_modalities_receive_gradients():

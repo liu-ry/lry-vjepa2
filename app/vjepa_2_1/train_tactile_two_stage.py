@@ -673,7 +673,10 @@ def _normalized_context_latent_loss(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Absolute latent reconstruction loss for visible context tokens."""
     if predicted.shape != target.shape:
-        raise ValueError("context prediction and target shapes differ")
+        raise ValueError(
+            "context prediction and target shapes differ: "
+            f"{tuple(predicted.shape)} vs {tuple(target.shape)}"
+        )
     effective_scale = max(float(scale), 1e-6)
     error = F.smooth_l1_loss(
         predicted / effective_scale,
