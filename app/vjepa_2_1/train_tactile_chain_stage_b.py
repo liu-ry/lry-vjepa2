@@ -204,6 +204,7 @@ def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
             horizon=horizon,
             items=[items[index] for index in indices],
             windows_per_episode=windows,
+            window_overlap=float(cfg.get("window_overlap", 1.0 / 3.0)),
             random_crop=random_crop,
             balance_single_dual=bool(
                 cfg.get("balance_single_dual", True)
@@ -437,6 +438,7 @@ class ChainStageB:
             ),
             drop_path=float(self.section.get("drop_path", 0.05)),
         ).to(device)
+        self.predictor_base = self.predictor
         self.contact_probe = nn.Sequential(
             nn.LayerNorm(2 * self.embed_dim),
             nn.Linear(2 * self.embed_dim, 1),
@@ -588,7 +590,7 @@ class ChainStageB:
                 if arm_dropout > 0:
                     drop_arm = torch.rand(
                         chain_valid.shape[0],
-                        self.predictor.num_arms,
+                        self.predictor_base.num_arms,
                         device=self.device,
                     ) < arm_dropout
                     drop_chain = drop_arm[:, [0, 0, 1, 1]]
@@ -835,7 +837,7 @@ class ChainStageB:
         )
         query_std = (
             output["condition_tokens"].detach().std(dim=1).mean()
-            if self.predictor.num_condition_tokens > 1
+            if self.predictor_base.num_condition_tokens > 1
             else torch.zeros((), device=output["condition_tokens"].device)
         )
         single_arm = (arm_valid.sum(dim=1) == 1).float().mean()
@@ -912,7 +914,7 @@ class ChainStageB:
 
     def state_dict(self) -> dict:
         return {
-            "predictor": self.predictor.state_dict(),
+            "predictor": self.predictor_base.state_dict(),
             "contact_probe": self.contact_probe.state_dict(),
             "slip_probe": self.slip_probe.state_dict(),
             "optimizer": self.opt.state_dict(),
@@ -1077,7 +1079,7 @@ def main() -> None:
     output = (
         Path(
             ensure_writable_output(
-                unique_output_dir(requested),
+                unique_output_dir(requested, resume=args.resume),
                 cfg.get("protected_data_roots", ()),
             )
         )
@@ -1121,7 +1123,7 @@ def main() -> None:
         resume_state = torch.load(
             args.resume, map_location=device, weights_only=False
         )
-        trainer.predictor.load_state_dict(resume_state["predictor"])
+        trainer.predictor_base.load_state_dict(resume_state["predictor"])
         trainer.contact_probe.load_state_dict(
             resume_state["contact_probe"]
         )
@@ -1272,7 +1274,7 @@ def main() -> None:
             map_location=device,
             weights_only=False,
         )
-        trainer.predictor.load_state_dict(state["predictor"])
+        trainer.predictor_base.load_state_dict(state["predictor"])
         trainer.contact_probe.load_state_dict(state["contact_probe"])
         trainer.slip_probe.load_state_dict(state["slip_probe"])
         test = evaluate(

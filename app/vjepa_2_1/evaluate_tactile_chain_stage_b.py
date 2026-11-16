@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -20,6 +21,51 @@ from app.vjepa_2_1.train_tactile_chain_stage_b import (
     ChainStageB,
     _build_loaders,
 )
+
+
+def _load_groups(path: str | None) -> set[str] | None:
+    if path is None:
+        return None
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"group file must contain a JSON list: {path}")
+    return {str(group) for group in payload}
+
+
+def _filter_loader_groups(
+    loader: DataLoader,
+    groups: set[str] | None,
+) -> DataLoader:
+    if groups is None:
+        return loader
+    dataset = loader.dataset
+    if dataset.dense_windows:
+        raise ValueError(
+            "group filtering expects a fixed-window dataset; "
+            "set windows_per_episode before building evaluation loaders"
+        )
+    indices = []
+    for item_index, item in enumerate(dataset.items):
+        if str(item["group"]) not in groups:
+            continue
+        offset = item_index * dataset.windows_per_episode
+        indices.extend(
+            range(offset, offset + dataset.windows_per_episode)
+        )
+    if not indices:
+        raise ValueError("group filtering produced an empty loader")
+    kwargs = {
+        "batch_size": loader.batch_size,
+        "shuffle": False,
+        "num_workers": loader.num_workers,
+        "pin_memory": loader.pin_memory,
+    }
+    if loader.num_workers > 0:
+        kwargs.update(
+            prefetch_factor=loader.prefetch_factor,
+            persistent_workers=loader.persistent_workers,
+        )
+    return DataLoader(Subset(dataset, indices), **kwargs)
 
 
 def _collect(trainer, loader, max_batches: int):
@@ -194,8 +240,24 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--train-batches", type=int, default=512)
     parser.add_argument("--test-batches", type=int, default=0)
+    parser.add_argument(
+        "--train-groups",
+        default=None,
+        help="Optional JSON list of episode groups for ridge fitting.",
+    )
+    parser.add_argument(
+        "--test-groups",
+        default=None,
+        help="Optional JSON list of episode groups for held-out probes.",
+    )
     args = parser.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    random.seed(731)
+    torch.manual_seed(731)
+    train_groups = _load_groups(args.train_groups)
+    test_groups = _load_groups(args.test_groups)
+    if train_groups is not None:
+        cfg["windows_per_episode"] = 2
     cfg["predictor_training"]["predictor_depth"] = args.predictor_depth
     cfg["predictor_training"]["condition_depth"] = args.condition_depth
     height, width = args.latent_grid.lower().split("x", 1)
@@ -220,6 +282,8 @@ def main() -> None:
     train_loader, _, test_loader, split = _build_loaders(
         cfg, batch_size=1, rank=0, world_size=1
     )
+    train_loader = _filter_loader_groups(train_loader, train_groups)
+    test_loader = _filter_loader_groups(test_loader, test_groups)
     generator = torch.Generator().manual_seed(731)
     train_order = torch.randperm(
         len(train_loader.dataset), generator=generator
@@ -253,6 +317,14 @@ def main() -> None:
         "query_geometry": _query_geometry(test_features),
         "n_train_samples": int(train_features["condition_tokens"].shape[0]),
         "n_test_samples": int(test_features["condition_tokens"].shape[0]),
+        "group_filter": {
+            "n_train_groups": (
+                len(train_groups) if train_groups is not None else None
+            ),
+            "n_test_groups": (
+                len(test_groups) if test_groups is not None else None
+            ),
+        },
     }
     Path(args.output).write_text(
         json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"

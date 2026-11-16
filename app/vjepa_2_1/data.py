@@ -193,6 +193,7 @@ class RobotVisionTactileDataset(Dataset):
         vision_std=(0.229, 0.224, 0.225),
         items=None,
         windows_per_episode=1,
+        window_overlap=1.0 / 3.0,
         load_horizon=None,
         load_vision=True,
         load_vision_frames=None,
@@ -221,8 +222,8 @@ class RobotVisionTactileDataset(Dataset):
         if load_horizon < 0:
             raise ValueError("load_horizon must be non-negative")
         windows_per_episode = int(windows_per_episode)
-        if windows_per_episode <= 0:
-            raise ValueError("windows_per_episode must be positive")
+        if windows_per_episode < 0:
+            raise ValueError("windows_per_episode must be non-negative")
 
         self.context, self.horizon = int(context), int(horizon)
         self.load_horizon = load_horizon
@@ -244,26 +245,50 @@ class RobotVisionTactileDataset(Dataset):
             raise ValueError("num_hands must be None, 1, or 2")
         self.min_hand_contact_frames = max(0, int(min_hand_contact_frames))
         self.windows_per_episode = windows_per_episode
+        self.dense_windows = windows_per_episode == 0
+        self.window_overlap = float(window_overlap)
+        if not 0.0 <= self.window_overlap < 1.0:
+            raise ValueError("window_overlap must be in [0, 1)")
+        self._usable_length_cache = {}
+        self._contact_cache = {}
+        self._dense_start_cache = {}
+        self._dense_window_counts = None
         self.vision_mean = torch.tensor(vision_mean, dtype=torch.float32).view(1, -1, 1, 1)
         self.vision_std = torch.tensor(vision_std, dtype=torch.float32).view(1, -1, 1, 1)
 
     def __len__(self):
+        if self.dense_windows:
+            return int(self._dense_counts().sum())
         return len(self.items) * self.windows_per_episode
 
     def _resolve(self, path: str) -> Path:
         path = Path(path)
         return path if path.is_absolute() else self.root / path
 
+    def _record_key(self, record: dict) -> tuple:
+        contact = record.get("contact")
+        return (
+            str(record["vision"]),
+            tuple(_path_parts(record["tactile"])),
+            tuple(_path_parts(contact)) if contact else (),
+        )
+
     def _sources(self, record: dict, key: str) -> tuple[Path, ...]:
         return tuple(self._resolve(path) for path in _path_parts(record[key]))
 
     def _usable_length(self, record: dict) -> int:
+        cache_key = self._record_key(record)
+        cached = self._usable_length_cache.get(cache_key)
+        if cached is not None:
+            return int(cached)
         lengths = [_sequence_length(path) for path in self._sources(record, "vision")]
         lengths += [_sequence_length(path) for path in self._sources(record, "tactile")]
         for key in ("state", "action", "contact", "slip"):
             if key in record:
                 lengths += [_sequence_length(path) for path in self._sources(record, key)]
-        return min(lengths)
+        length = min(lengths)
+        self._usable_length_cache[cache_key] = length
+        return length
 
     def _hand_presence(self, record: dict) -> np.ndarray:
         present = np.zeros(2, dtype=bool)
@@ -305,6 +330,10 @@ class RobotVisionTactileDataset(Dataset):
 
     def contact_window_starts(self, record: dict) -> np.ndarray:
         """Return window starts satisfying the configured contact minimum."""
+        cache_key = self._record_key(record)
+        cached = self._contact_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if not self.require_contact:
             raise ValueError("contact_window_starts requires require_contact=True")
         contact = self._contact_matrix(record)
@@ -324,7 +353,72 @@ class RobotVisionTactileDataset(Dataset):
         keep = valid_hands.any(axis=-1) & (
             contact_frames >= self.min_contact_frames
         )
-        return np.flatnonzero(keep)
+        starts = np.flatnonzero(keep)
+        self._contact_cache[cache_key] = starts
+        return starts
+
+    def _window_stride(self, count: int) -> int:
+        return max(
+            1,
+            int(round(int(count) * (1.0 - self.window_overlap))),
+        )
+
+    def _dense_starts(
+        self, candidates: np.ndarray, count: int
+    ) -> np.ndarray:
+        candidates = np.asarray(candidates, dtype=np.int64)
+        if len(candidates) == 0:
+            return candidates
+        stride = self._window_stride(count)
+        selected = []
+        next_start = int(candidates[0])
+        for start in candidates:
+            start = int(start)
+            if start >= next_start:
+                selected.append(start)
+                next_start = start + stride
+        if selected[-1] != int(candidates[-1]):
+            selected.append(int(candidates[-1]))
+        return np.asarray(selected, dtype=np.int64)
+
+    def _item_dense_starts(self, record: dict) -> np.ndarray:
+        cache_key = self._record_key(record)
+        cached = self._dense_start_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        count = self.context + self.load_horizon
+        if self.require_contact:
+            candidates = self.contact_window_starts(record)
+        else:
+            usable = self._usable_length(record)
+            candidates = (
+                np.arange(0, usable - count + 1, dtype=np.int64)
+                if usable >= count
+                else np.zeros(0, dtype=np.int64)
+            )
+        starts = self._dense_starts(candidates, count)
+        self._dense_start_cache[cache_key] = starts
+        return starts
+
+    def _dense_counts(self) -> np.ndarray:
+        if self._dense_window_counts is None:
+            self._dense_window_counts = np.asarray(
+                [len(self._item_dense_starts(record)) for record in self.items],
+                dtype=np.int64,
+            )
+        return self._dense_window_counts
+
+    def _locate_dense_index(self, index: int) -> tuple[int, int]:
+        counts = self._dense_counts()
+        total = int(counts.sum())
+        if index < 0:
+            index += total
+        if index < 0 or index >= total:
+            raise IndexError(index)
+        cumulative = np.cumsum(counts)
+        item_index = int(np.searchsorted(cumulative, index, side="right"))
+        previous = int(cumulative[item_index - 1]) if item_index else 0
+        return item_index, index - previous
 
     def _prepare_vision(self, vision: torch.Tensor) -> torch.Tensor:
         """返回符合 V-JEPA 约定的 ``[T,C,H,W]`` 浮点输入。"""
@@ -362,8 +456,11 @@ class RobotVisionTactileDataset(Dataset):
         return tactile
 
     def __getitem__(self, index):
-        item_index = int(index) // self.windows_per_episode
-        local_window = int(index) % self.windows_per_episode
+        if self.dense_windows:
+            item_index, local_window = self._locate_dense_index(int(index))
+        else:
+            item_index = int(index) // self.windows_per_episode
+            local_window = int(index) % self.windows_per_episode
         record = self.items[item_index]
         n = self.context + self.load_horizon
         usable = self._usable_length(record)
@@ -379,7 +476,14 @@ class RobotVisionTactileDataset(Dataset):
                 raise ValueError(
                     f"record {record.get('vision')!r} has no contact-rich window"
                 )
-        if contact_starts is not None:
+        if self.dense_windows:
+            dense_starts = self._item_dense_starts(record)
+            if len(dense_starts) == 0:
+                raise ValueError(
+                    f"record {record.get('vision')!r} has no usable window"
+                )
+            start = int(dense_starts[local_window])
+        elif contact_starts is not None:
             if self.random_crop:
                 start = int(random.choice(contact_starts.tolist()))
             else:

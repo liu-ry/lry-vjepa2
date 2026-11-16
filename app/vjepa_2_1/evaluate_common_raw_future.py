@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import yaml
+from torch.utils.data import DataLoader, Subset
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -21,6 +23,51 @@ from app.vjepa_2_1.train_tactile_chain_stage_b import (
     _build_loaders,
     _encode_chains,
 )
+
+
+def _load_groups(path: str | None) -> set[str] | None:
+    if path is None:
+        return None
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"group file must contain a JSON list: {path}")
+    return {str(group) for group in payload}
+
+
+def _filter_loader_groups(
+    loader: DataLoader,
+    groups: set[str] | None,
+) -> DataLoader:
+    if groups is None:
+        return loader
+    dataset = loader.dataset
+    if dataset.dense_windows:
+        raise ValueError(
+            "group filtering expects a fixed-window dataset; "
+            "set windows_per_episode before building readout loaders"
+        )
+    indices = []
+    for item_index, item in enumerate(dataset.items):
+        if str(item["group"]) not in groups:
+            continue
+        offset = item_index * dataset.windows_per_episode
+        indices.extend(
+            range(offset, offset + dataset.windows_per_episode)
+        )
+    if not indices:
+        raise ValueError("group filtering produced an empty loader")
+    kwargs = {
+        "batch_size": loader.batch_size,
+        "shuffle": False,
+        "num_workers": loader.num_workers,
+        "pin_memory": loader.pin_memory,
+    }
+    if loader.num_workers > 0:
+        kwargs.update(
+            prefetch_factor=loader.prefetch_factor,
+            persistent_workers=loader.persistent_workers,
+        )
+    return DataLoader(Subset(dataset, indices), **kwargs)
 
 
 def _raw_future_summary(
@@ -130,10 +177,28 @@ def main() -> None:
     parser.add_argument("--train-batches", type=int, default=64)
     parser.add_argument("--test-batches", type=int, default=0)
     parser.add_argument("--ridge", type=float, default=0.01)
+    parser.add_argument(
+        "--train-groups",
+        default=None,
+        help="Optional JSON list of episode groups for readout fitting.",
+    )
+    parser.add_argument(
+        "--test-groups",
+        default=None,
+        help="Optional JSON list of episode groups for held-out evaluation.",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    random.seed(731)
+    torch.manual_seed(731)
+    train_groups = _load_groups(args.train_groups)
+    test_groups = _load_groups(args.test_groups)
+    if train_groups is not None:
+        # Keep readout fitting on the same number of fixed windows per episode
+        # when comparing runs with different dense-training configurations.
+        cfg["windows_per_episode"] = 2
     height, width = args.latent_grid.lower().split("x", 1)
     trainer = ChainStageB(
         cfg,
@@ -155,6 +220,8 @@ def main() -> None:
         rank=0,
         world_size=1,
     )
+    train_loader = _filter_loader_groups(train_loader, train_groups)
+    test_loader = _filter_loader_groups(test_loader, test_groups)
 
     train_x: list[list[torch.Tensor]] = [[] for _ in range(4 * 30)]
     train_y: list[list[torch.Tensor]] = [[] for _ in range(4 * 30)]
@@ -216,6 +283,8 @@ def main() -> None:
         "split": split,
         "ridge": float(args.ridge),
         "train_batches": int(args.train_batches),
+        "train_groups": len(train_groups) if train_groups is not None else None,
+        "test_groups": len(test_groups) if test_groups is not None else None,
         "raw_future_mse_by_chain_horizon": mse,
         "raw_copy_mse_by_chain_horizon": copy,
         "raw_mse": float((squared_error / samples).mean()),

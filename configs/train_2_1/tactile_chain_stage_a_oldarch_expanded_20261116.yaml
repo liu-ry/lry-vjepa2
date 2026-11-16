@@ -1,0 +1,85 @@
+# Original formal Stage-A recipe, retrained on the expanded dataset.
+manifest: /liury/src/lry-vjepa2/data/manifests/contact_v6_4chain_20261115/chains.jsonl
+protected_data_roots:
+  - /data/upload/recorder_1
+seed: 1
+split_seed: 0
+val_ratio: 0.15
+test_ratio: 0.10
+stable_group_split: true
+output_root: /liury/src/lry-vjepa2/data/runs/tactile_oldarch_expanded_20261116
+require_contact: true
+encoder_min_contact_frames: 4
+min_hand_contact_frames: 1
+context: 4
+horizon: 30
+crop_size: 384
+normalize_vision: true
+num_workers: 4
+prefetch_factor: 1
+persistent_workers: true
+tensor_sharing_strategy: file_system
+windows_per_episode: 0
+window_overlap: 0.3333333333333333
+val_windows_per_episode: 1
+task_balance_power: 0.0
+event_contact_threshold: 0.0039
+event_slip_threshold: 0.0035
+
+tactile:
+  in_channels: 3
+  use_delta: true
+  patch_size: 16
+  img_size: [336, 224]
+  tubelet_size: 1
+  embed_dim: 384
+  depth: 6
+  num_heads: 6
+  use_rope: true
+  drop_path: 0.1
+  input_dim: null
+  taxel_grid: null
+
+encoder_training:
+  stage_a_objective: future_forecast
+  stage_a_future_offsets: [1, 2, 4, 8, 16, 30]
+  temporal_attention: per_frame_causal
+  causal_temporal_depth: 2
+  latent_spatial_grid: [7, 7]
+  latent_context_frames: 4
+  latent_mask_mode: future_frames
+  latent_token_mask_ratio: 0.75
+  masked_encoding_probability: 0.5
+  latent_predictor_dim: 384
+  latent_predictor_depth: 2
+  latent_predictor_heads: 6
+  latent_predictor_drop_path: 0.05
+  latent_query_chunk_size: 4
+  latent_delta_scale: 0.01
+  latent_clip_loss_scale: 0.01
+  latent_context_loss_scale: 0.01
+  latent_direction_weight: 0.1
+  lambda_context_prediction: 0.1
+  lambda_variance: 0.05
+  lambda_covariance: 0.01
+  lambda_contact: 0.05
+  lambda_slip: 0.05
+  lambda_temporal: 1.0
+  temporal_change_scale: 0.05
+  ema_encoder: 0.999
+  probe_selection_weight: 0.001
+  lr_schedule_steps: 8000
+  batch_size: 16
+  lr: 0.0001
+  weight_decay: 0.05
+  warmup_steps: 200
+  min_lr_scale: 0.02
+  amp: true
+  amp_dtype: bfloat16
+  checkpoint_every_steps: 250
+  max_val_batches: 64
+  max_test_batches: 0
+  log_every: 20
+  early_stopping_min_steps: 2000
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0002

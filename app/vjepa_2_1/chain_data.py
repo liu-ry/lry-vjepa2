@@ -37,6 +37,7 @@ class ChainEpisodeDataset(Dataset):
         horizon=34,
         items=None,
         windows_per_episode=1,
+        window_overlap=1.0 / 3.0,
         random_crop=True,
         require_contact=True,
         min_contact_frames=34,
@@ -60,7 +61,14 @@ class ChainEpisodeDataset(Dataset):
         self.context = int(context)
         self.horizon = int(horizon)
         self.load_horizon = self.horizon
-        self.windows_per_episode = max(1, int(windows_per_episode))
+        windows_per_episode = int(windows_per_episode)
+        if windows_per_episode < 0:
+            raise ValueError("windows_per_episode must be non-negative")
+        self.windows_per_episode = windows_per_episode
+        self.dense_windows = windows_per_episode == 0
+        self.window_overlap = float(window_overlap)
+        if not 0.0 <= self.window_overlap < 1.0:
+            raise ValueError("window_overlap must be in [0, 1)")
         self.random_crop = bool(random_crop)
         self.require_contact = bool(require_contact)
         self.min_contact_frames = max(1, int(min_contact_frames))
@@ -75,6 +83,8 @@ class ChainEpisodeDataset(Dataset):
         self._usable_length_cache = {}
         self._contact_window_cache = {}
         self._window_groups_cache = {}
+        self._dense_start_cache = {}
+        self._dense_window_counts = None
         self.vision_helper = RobotVisionTactileDataset(
             manifest,
             context=self.context,
@@ -86,6 +96,8 @@ class ChainEpisodeDataset(Dataset):
         )
 
     def __len__(self):
+        if self.dense_windows:
+            return int(self._dense_counts().sum())
         return len(self.items) * self.windows_per_episode
 
     def _resolve(self, value) -> Path:
@@ -188,9 +200,75 @@ class ChainEpisodeDataset(Dataset):
         }
         return starts
 
+    def _window_stride(self, count: int) -> int:
+        return max(
+            1,
+            int(round(int(count) * (1.0 - self.window_overlap))),
+        )
+
+    def _dense_starts(
+        self, candidates: np.ndarray, count: int
+    ) -> np.ndarray:
+        candidates = np.asarray(candidates, dtype=np.int64)
+        if len(candidates) == 0:
+            return candidates
+        stride = self._window_stride(count)
+        selected = []
+        next_start = int(candidates[0])
+        for start in candidates:
+            start = int(start)
+            if start >= next_start:
+                selected.append(start)
+                next_start = start + stride
+        if selected[-1] != int(candidates[-1]):
+            selected.append(int(candidates[-1]))
+        return np.asarray(selected, dtype=np.int64)
+
+    def _item_dense_starts(self, item: dict) -> np.ndarray:
+        cache_key = str(item["group"])
+        cached = self._dense_start_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        count = self.context + self.horizon
+        if self.require_contact:
+            candidates = self.contact_window_starts(item)
+        else:
+            usable = self._usable_length(item)
+            candidates = (
+                np.arange(0, usable - count + 1, dtype=np.int64)
+                if usable >= count
+                else np.zeros(0, dtype=np.int64)
+            )
+        starts = self._dense_starts(candidates, count)
+        self._dense_start_cache[cache_key] = starts
+        return starts
+
+    def _dense_counts(self) -> np.ndarray:
+        if self._dense_window_counts is None:
+            self._dense_window_counts = np.asarray(
+                [len(self._item_dense_starts(item)) for item in self.items],
+                dtype=np.int64,
+            )
+        return self._dense_window_counts
+
+    def _locate_dense_index(self, index: int) -> tuple[int, int]:
+        counts = self._dense_counts()
+        total = int(counts.sum())
+        if index < 0:
+            index += total
+        if index < 0 or index >= total:
+            raise IndexError(index)
+        cumulative = np.cumsum(counts)
+        item_index = int(np.searchsorted(cumulative, index, side="right"))
+        previous = int(cumulative[item_index - 1]) if item_index else 0
+        return item_index, index - previous
+
     def __getitem__(self, index):
-        item_index = int(index) // self.windows_per_episode
-        local_window = int(index) % self.windows_per_episode
+        if self.dense_windows:
+            item_index, local_window = self._locate_dense_index(int(index))
+        else:
+            item_index = int(index) // self.windows_per_episode
+            local_window = int(index) % self.windows_per_episode
         item = self.items[item_index]
         n = self.context + self.horizon
         usable = self._usable_length(item)
@@ -199,7 +277,14 @@ class ChainEpisodeDataset(Dataset):
                 f"episode {item['group']!r} has {usable} frames < {n}"
             )
         starts = self.contact_window_starts(item) if self.require_contact else None
-        if starts is not None:
+        if self.dense_windows:
+            dense_starts = self._item_dense_starts(item)
+            if len(dense_starts) == 0:
+                raise ValueError(
+                    f"episode {item['group']!r} has no usable window"
+                )
+            start = int(dense_starts[local_window])
+        elif starts is not None:
             if not len(starts):
                 raise ValueError(f"episode {item['group']!r} has no contact window")
             groups = self._window_groups_cache.get(str(item["group"]), {})

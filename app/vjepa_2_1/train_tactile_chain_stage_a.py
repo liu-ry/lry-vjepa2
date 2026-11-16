@@ -727,6 +727,7 @@ def build_loaders(cfg, *, batch_size, rank, world_size):
             min_contact_frames=min_contact,
             min_hand_contact_frames=1,
             windows_per_episode=windows,
+            window_overlap=float(cfg.get("window_overlap", 1.0 / 3.0)),
             random_crop=random_crop,
             num_hands=None,
         )
@@ -956,18 +957,39 @@ def main():
         cfg, batch_size=int(cfg["encoder_training"].get("batch_size", 2)), rank=rank, world_size=world_size
     )
     section = cfg["encoder_training"]
-    steps = int(args.max_steps or section.get("max_steps", 30000))
+    configured_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else section.get("max_steps")
+    )
+    steps = (
+        None
+        if configured_steps is None or int(configured_steps) <= 0
+        else int(configured_steps)
+    )
+    min_steps = int(section.get("early_stopping_min_steps", 3000))
+    patience = int(section.get("early_stopping_patience", 8))
+    min_delta = float(section.get("early_stopping_min_delta", 0.0))
+    check_every = int(section.get("checkpoint_every_steps", 250))
+    schedule_steps = int(
+        section.get(
+            "lr_schedule_steps",
+            steps
+            if steps is not None
+            else max(8000, min_steps + patience * check_every),
+        )
+    )
     scheduler = WarmupCosineMultiplier(
-        base.opt, steps, int(section.get("warmup_steps", 200)), min_lr_scale=float(section.get("min_lr_scale", 0.02))
+        base.opt,
+        schedule_steps,
+        int(section.get("warmup_steps", 200)),
+        min_lr_scale=float(section.get("min_lr_scale", 0.02)),
     )
     scheduler.jump_to(start_step)
     bad = 0
     records = {}
-    min_steps = int(section.get("early_stopping_min_steps", 3000))
-    patience = int(section.get("early_stopping_patience", 8))
-    check_every = int(section.get("checkpoint_every_steps", 250))
     step = start_step
-    while step < steps:
+    while steps is None or step < steps:
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(step)
         for batch in train_loader:
@@ -983,20 +1005,25 @@ def main():
             update_ema(base.encoder, base.encoder_target, float(section.get("ema_encoder", 0.999)))
             if is_main_process() and (step == 1 or step % int(section.get("log_every", 20)) == 0):
                 print(f"[stageA] step={step} " + " ".join(f"{k}={float(v):.5f}" for k,v in metrics.items()), flush=True)
-            if step % check_every == 0 or step >= steps:
+            if step % check_every == 0 or (
+                steps is not None and step >= steps
+            ):
                 val = evaluate(module, val_loader, int(section.get("max_val_batches", 64)))
                 score = val["joint_relative"] + float(section.get("probe_selection_weight", 0.001)) * (2 - val["contact_auroc"] - val["slip_auroc"])
                 if is_main_process():
                     payload = {
-                        **module.state_dict_for_checkpoint(),
+                        **base.state_dict_for_checkpoint(),
                         "step": step,
                         "score": score,
                     }
                     torch.save(payload, output / "latest.pt")
                     if score < best:
+                        improvement = best - score
                         best, best_step, bad = score, step, 0
                         torch.save(payload, output / "best.pt")
-                    elif step >= min_steps:
+                    else:
+                        improvement = 0.0
+                    if step >= min_steps and improvement < min_delta:
                         bad += 1
                     print(f"[stageA] val step={step} score={score:.6f} best={best:.6f}@{best_step} bad={bad}/{patience}", flush=True)
                     records[str(step)] = {
@@ -1004,6 +1031,7 @@ def main():
                         "validation": val,
                         "best_step": best_step,
                         "bad_checks": bad,
+                        "improvement": improvement,
                     }
                     (output / "metrics.json").write_text(
                         json.dumps(
@@ -1026,7 +1054,7 @@ def main():
                     if is_main_process():
                         print(f"[stageA] early stop {step}", flush=True)
                     break
-            if step >= steps:
+            if steps is not None and step >= steps:
                 break
         else:
             continue
@@ -1034,6 +1062,16 @@ def main():
     if world_size > 1:
         dist.barrier()
     if is_main_process():
+        best_payload = torch.load(
+            output / "best.pt", map_location=device, weights_only=False
+        )
+        base.encoder.load_state_dict(best_payload["encoder"])
+        base.encoder_target.load_state_dict(
+            best_payload.get("encoder_target", best_payload["encoder"])
+        )
+        base.predictor.load_state_dict(best_payload["predictor"])
+        base.contact_probe.load_state_dict(best_payload["contact_probe"])
+        base.slip_probe.load_state_dict(best_payload["slip_probe"])
         test = evaluate(module, test_loader, int(section.get("max_test_batches", 0)))
         (output / "test_metrics.json").write_text(json.dumps({"test_metrics":test,"split":split}, indent=2), encoding="utf-8")
         print(f"[stageA] finished best={best_step}@{best}", flush=True)
