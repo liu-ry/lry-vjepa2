@@ -240,6 +240,8 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--train-batches", type=int, default=512)
     parser.add_argument("--test-batches", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=3)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
         "--train-groups",
         default=None,
@@ -258,6 +260,7 @@ def main() -> None:
     test_groups = _load_groups(args.test_groups)
     if train_groups is not None:
         cfg["windows_per_episode"] = 2
+    cfg["num_workers"] = int(args.num_workers)
     cfg["predictor_training"]["predictor_depth"] = args.predictor_depth
     cfg["predictor_training"]["condition_depth"] = args.condition_depth
     height, width = args.latent_grid.lower().split("x", 1)
@@ -280,7 +283,7 @@ def main() -> None:
     trainer.contact_probe.eval()
     trainer.slip_probe.eval()
     train_loader, _, test_loader, split = _build_loaders(
-        cfg, batch_size=1, rank=0, world_size=1
+        cfg, batch_size=int(args.batch_size), rank=0, world_size=1
     )
     train_loader = _filter_loader_groups(train_loader, train_groups)
     test_loader = _filter_loader_groups(test_loader, test_groups)
@@ -292,7 +295,7 @@ def main() -> None:
         len(test_loader.dataset), generator=generator
     ).tolist()
     loader_kwargs = {
-        "batch_size": 1,
+        "batch_size": int(args.batch_size),
         "num_workers": int(cfg.get("num_workers", 4)),
         "pin_memory": True,
         "persistent_workers": True,

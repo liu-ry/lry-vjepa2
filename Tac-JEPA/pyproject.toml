@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tac-jepa"
+version = "0.1.0"
+description = "Portable causal tactile encoder and future tactile latent world model"
+requires-python = ">=3.10"
+dependencies = [
+  "einops>=0.7",
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "PyYAML>=6.0",
+  "timm>=0.9",
+  "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tac_jepa*"]

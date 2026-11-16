@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, RandomSampler, Subset
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -58,7 +58,7 @@ def _filter_loader_groups(
         raise ValueError("group filtering produced an empty loader")
     kwargs = {
         "batch_size": loader.batch_size,
-        "shuffle": False,
+        "shuffle": isinstance(loader.sampler, RandomSampler),
         "num_workers": loader.num_workers,
         "pin_memory": loader.pin_memory,
     }

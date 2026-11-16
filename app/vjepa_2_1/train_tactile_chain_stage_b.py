@@ -1115,7 +1115,16 @@ def main() -> None:
     train_loader, val_loader, test_loader, split = _build_loaders(
         cfg, batch_size=batch_size, rank=rank, world_size=world_size
     )
-    steps = int(args.max_steps or section.get("max_steps", 10000))
+    configured_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else section.get("max_steps")
+    )
+    steps = (
+        None
+        if configured_steps is None or int(configured_steps) <= 0
+        else int(configured_steps)
+    )
     start_step = 0
     best = math.inf
     best_step = 0
@@ -1140,13 +1149,29 @@ def main() -> None:
         best_step = start_step
         if args.reset_best:
             best = math.inf
-        if not args.eval_only and start_step >= steps:
+        if (
+            not args.eval_only
+            and steps is not None
+            and start_step >= steps
+        ):
             raise ValueError(
                 f"resume step {start_step} is not below max_steps={steps}"
             )
+    min_steps = int(section.get("early_stopping_min_steps", 3000))
+    patience = int(section.get("early_stopping_patience", 8))
+    min_delta = float(section.get("early_stopping_min_delta", 0.0))
+    check_every = int(section.get("checkpoint_every_steps", 250))
+    schedule_steps = int(
+        section.get(
+            "lr_schedule_steps",
+            steps
+            if steps is not None
+            else max(10000, min_steps + patience * check_every),
+        )
+    )
     scheduler = WarmupCosineMultiplier(
         trainer.opt,
-        steps,
+        schedule_steps,
         int(section.get("warmup_steps", 200)),
         min_lr_scale=float(section.get("min_lr_scale", 0.02)),
     )
@@ -1173,9 +1198,6 @@ def main() -> None:
         return
     bad = 0
     records = {}
-    min_steps = int(section.get("early_stopping_min_steps", 3000))
-    patience = int(section.get("early_stopping_patience", 8))
-    check_every = int(section.get("checkpoint_every_steps", 250))
     step = start_step
     if rank == 0:
         (output / "split.json").write_text(
@@ -1188,7 +1210,7 @@ def main() -> None:
         (output / "resolved_config.yaml").write_text(
             yaml.safe_dump(resolved, sort_keys=False), encoding="utf-8"
         )
-    while step < steps:
+    while steps is None or step < steps:
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(step)
         for batch in train_loader:
@@ -1205,7 +1227,9 @@ def main() -> None:
                     ),
                     flush=True,
                 )
-            if step % check_every == 0 or step >= steps:
+            if step % check_every == 0 or (
+                steps is not None and step >= steps
+            ):
                 stop = False
                 if rank == 0:
                     val = evaluate(
@@ -1222,17 +1246,21 @@ def main() -> None:
                     }
                     torch.save(payload, output / "latest_predictor.pt")
                     if score < best:
+                        improvement = best - score
                         best = score
                         best_step = step
                         bad = 0
                         torch.save(payload, output / "best_predictor.pt")
-                    elif step >= min_steps:
+                    else:
+                        improvement = 0.0
+                    if step >= min_steps and improvement < min_delta:
                         bad += 1
                     stop = step >= min_steps and bad >= patience
                     records[str(step)] = {
                         "score": score,
                         "best_step": best_step,
                         "bad_checks": bad,
+                        "improvement": improvement,
                         "validation": val,
                     }
                     (output / "metrics.json").write_text(
@@ -1263,7 +1291,7 @@ def main() -> None:
                     stop = bool(stop_tensor.item())
                 if stop:
                     break
-            if step >= steps:
+            if steps is not None and step >= steps:
                 break
         else:
             continue

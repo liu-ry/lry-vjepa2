@@ -62,7 +62,7 @@ model:
 
 predictor_training:
   vjepa_checkpoint: /liury/src/lry-vjepa2/data/model/vjepa2_1_vitb_dist_vitG_384.pt
-  max_steps: 4000
+  lr_schedule_steps: 12000
   batch_size: 12
   target_future_mode: absolute_full_clip
   target_encoder_source: ema
@@ -99,5 +99,6 @@ predictor_training:
   max_val_batches: 64
   max_test_batches: 0
   log_every: 20
-  early_stopping_min_steps: 3000
+  early_stopping_min_steps: 4000
   early_stopping_patience: 8
+  early_stopping_min_delta: 0.0002

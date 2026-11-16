@@ -1,0 +1,6 @@
+torch>=2.1
+numpy>=1.24
+PyYAML>=6.0
+timm>=0.9
+einops>=0.7
+opencv-python>=4.8
