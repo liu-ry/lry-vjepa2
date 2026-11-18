@@ -7,7 +7,14 @@ split_seed: 0
 val_ratio: 0.15
 test_ratio: 0.10
 stable_group_split: true
-require_contact: true
+require_contact: false
+window_sampling: all
+train_window_sampling: all
+no_contact_fraction: 0.0
+val_window_sampling: stratified
+test_window_sampling: stratified
+shuffle_eval_windows: true
+length_source: contact
 min_contact_frames: 4
 min_chain_contact_frames: 1
 context: 4
@@ -16,6 +23,7 @@ crop_size: 384
 normalize_vision: true
 visual_tubelet_size: 2
 num_workers: 8
+eval_num_workers: 0
 prefetch_factor: 1
 persistent_workers: true
 tensor_sharing_strategy: file_system
@@ -62,13 +70,15 @@ model:
 
 predictor_training:
   vjepa_checkpoint: checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
-  max_steps: 4000
+  max_steps: 0
+  lr_schedule_steps: 12000
   batch_size: 12
   target_future_mode: absolute_full_clip
   target_encoder_source: ema
   use_visual_history: true
   use_state_history: true
   selection_mode: tactile
+  selection_contact_weight: 0.35
   predictor_dim: 384
   predictor_heads: 6
   predictor_depth: 3
@@ -99,5 +109,6 @@ predictor_training:
   max_val_batches: 64
   max_test_batches: 0
   log_every: 20
-  early_stopping_min_steps: 3000
+  early_stopping_min_steps: 4000
   early_stopping_patience: 8
+  early_stopping_min_delta: 0.0002

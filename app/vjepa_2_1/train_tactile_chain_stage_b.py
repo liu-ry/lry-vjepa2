@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -166,11 +166,19 @@ def _align_temporal_embedding(
 
 def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
     context, horizon = int(cfg["context"]), int(cfg["horizon"])
+    require_contact = bool(cfg.get("require_contact", True))
+    window_sampling = str(cfg.get("window_sampling", "contact")).lower()
+    no_contact_fraction = cfg.get("no_contact_fraction")
+    manifest_sampling = (
+        window_sampling
+        if window_sampling in ("contact", "all", "mixed")
+        else "all"
+    )
     full = ChainEpisodeDataset(
         cfg["manifest"],
         context=context,
         horizon=horizon,
-        require_contact=True,
+        require_contact=require_contact,
         min_contact_frames=int(cfg.get("min_contact_frames", 4)),
         min_chain_contact_frames=int(cfg.get("min_chain_contact_frames", 1)),
         load_vision=True,
@@ -183,11 +191,27 @@ def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
         dual_window_probability=float(
             cfg.get("dual_window_probability", 0.5)
         ),
+        # The manifest prefilter only needs dense-start availability.
+        # Stratified sampling is defined for the fixed train/val/test views.
+        window_sampling=manifest_sampling,
+        no_contact_fraction=no_contact_fraction,
+        length_source=str(cfg.get("length_source", "all")).lower(),
     )
     items = [
         item
         for item in full.items
-        if len(full.contact_window_starts(item)) > 0
+        if len(full._item_dense_starts(item)) > 0
+        and any(full._available_paths(item, "tactile"))
+        and (
+            any(
+                full._available_path_group(group)
+                for group in item.get("vision_paths", [])
+            )
+            or any(
+                full._available_path_group(group)
+                for group in item.get("state_paths", [])
+            )
+        )
     ]
     train_idx, val_idx, test_idx, split = _three_way_group_split(
         items,
@@ -197,7 +221,7 @@ def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
         stable=bool(cfg.get("stable_group_split", True)),
     )
 
-    def make(indices, windows, random_crop):
+    def make(indices, windows, random_crop, sampling):
         return ChainEpisodeDataset(
             cfg["manifest"],
             context=context,
@@ -212,7 +236,7 @@ def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
             dual_window_probability=float(
                 cfg.get("dual_window_probability", 0.5)
             ),
-            require_contact=True,
+            require_contact=require_contact,
             min_contact_frames=int(cfg.get("min_contact_frames", 4)),
             min_chain_contact_frames=int(
                 cfg.get("min_chain_contact_frames", 1)
@@ -222,16 +246,38 @@ def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
             vision_size=int(cfg.get("crop_size", 384)),
             normalize_vision=bool(cfg.get("normalize_vision", True)),
             defer_image_conversion=True,
+            window_sampling=sampling,
+            no_contact_fraction=no_contact_fraction,
+            length_source=str(cfg.get("length_source", "all")).lower(),
         )
 
     train = make(
-        train_idx, int(cfg.get("windows_per_episode", 2)), True
+        train_idx,
+        int(cfg.get("windows_per_episode", 2)),
+        True,
+        str(
+            cfg.get("train_window_sampling", window_sampling)
+        ).lower(),
     )
     val = make(
-        val_idx, int(cfg.get("val_windows_per_episode", 1)), False
+        val_idx,
+        int(cfg.get("val_windows_per_episode", 1)),
+        False,
+        str(
+            cfg.get("val_window_sampling", "stratified")
+            if not require_contact
+            else "contact"
+        ).lower(),
     )
     test = make(
-        test_idx, int(cfg.get("val_windows_per_episode", 1)), False
+        test_idx,
+        int(cfg.get("val_windows_per_episode", 1)),
+        False,
+        str(
+            cfg.get("test_window_sampling", cfg.get("val_window_sampling", "stratified"))
+            if not require_contact
+            else "contact"
+        ).lower(),
     )
     sampler = (
         DistributedSampler(
@@ -262,26 +308,48 @@ def _build_loaders(cfg: dict, *, batch_size: int, rank: int, world_size: int):
         drop_last=len(train) >= batch_size,
         **kwargs,
     )
+    def deterministic_eval_dataset(dataset):
+        if not bool(cfg.get("shuffle_eval_windows", False)):
+            return dataset
+        generator = torch.Generator().manual_seed(
+            int(cfg.get("split_seed", 0)) + 7919
+        )
+        order = torch.randperm(
+            len(dataset), generator=generator
+        ).tolist()
+        return Subset(dataset, order)
+
+    val_eval = deterministic_eval_dataset(val)
+    test_eval = deterministic_eval_dataset(test)
+    eval_workers = int(cfg.get("eval_num_workers", workers))
+    eval_kwargs = {}
+    if eval_workers > 0:
+        eval_kwargs.update(
+            prefetch_factor=int(cfg.get("prefetch_factor", 2)),
+            persistent_workers=bool(
+                cfg.get("persistent_workers", True)
+            ),
+        )
     val_loader = (
         DataLoader(
-            val,
+            val_eval,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=workers,
+            num_workers=eval_workers,
             pin_memory=True,
-            **kwargs,
+            **eval_kwargs,
         )
         if not world_size > 1 or rank == 0
         else None
     )
     test_loader = (
         DataLoader(
-            test,
+            test_eval,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=workers,
+            num_workers=eval_workers,
             pin_memory=True,
-            **kwargs,
+            **eval_kwargs,
         )
         if not world_size > 1 or rank == 0
         else None
@@ -573,6 +641,56 @@ class ChainStageB:
             _auroc(slip_logits[chain_valid], slip_target[chain_valid]),
         )
 
+    def _categorized_tactile_metrics(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        current: torch.Tensor,
+        chain_valid: torch.Tensor,
+        contact: torch.Tensor,
+    ) -> dict[str, float]:
+        base = current.unsqueeze(1)
+        scale = max(float(self.section.get("delta_loss_scale", 0.01)), 1e-6)
+        error = F.smooth_l1_loss(
+            (prediction - base) / scale,
+            (target - base) / scale,
+            reduction="none",
+            beta=0.2,
+        ).mean(dim=(-2, -1))
+        copy = F.smooth_l1_loss(
+            torch.zeros_like(target),
+            (target - base) / scale,
+            reduction="none",
+            beta=0.2,
+        ).mean(dim=(-2, -1))
+        history_contact = contact[:, : self.context].any(dim=(1, 2))
+        future_contact = contact[:, self.context :].any(dim=(1, 2))
+        categories = {
+            "no_contact": ~history_contact & ~future_contact,
+            "contact": history_contact | future_contact,
+            "start": ~history_contact & future_contact,
+            "ongoing": history_contact & future_contact,
+            "end": history_contact & ~future_contact,
+        }
+        chain_mask = chain_valid[:, None, :].expand_as(error)
+        metrics = {}
+        for name, category in categories.items():
+            mask = chain_mask & category[:, None, None]
+            error_value = (
+                error * mask
+            ).sum() / mask.sum().clamp_min(1.0)
+            copy_value = (
+                copy * mask
+            ).sum() / mask.sum().clamp_min(1.0)
+            metrics[f"tactile_{name}_relative"] = (
+                (error_value.detach() + 1e-6)
+                / (copy_value.detach() + 1e-6)
+            ).item()
+            metrics[f"window_{name}_rate"] = float(
+                category.float().mean()
+            )
+        return metrics
+
     def step(self, batch: dict, train: bool) -> dict[str, float]:
         clip, _ = self._prepare_tactile(batch)
         chain_valid = batch["chain_valid"].to(self.device, dtype=torch.bool)
@@ -678,6 +796,13 @@ class ChainStageB:
                     ),
                     hand_valid=chain_valid,
                 )
+            )
+            category_metrics = self._categorized_tactile_metrics(
+                future_prediction,
+                target_future_time,
+                current_target,
+                chain_valid,
+                batch["contact"].to(self.device),
             )
             tactile_norm_error = (
                 F.normalize(future_prediction, dim=-1)
@@ -850,6 +975,15 @@ class ChainStageB:
                 + float(self.section.get("selection_condition_weight", 0.1))
                 * float(condition_summary_loss.detach())
             )
+        else:
+            contact_weight = float(
+                self.section.get("selection_contact_weight", 0.0)
+            )
+            selection = (
+                (1.0 - contact_weight) * selection
+                + contact_weight
+                * category_metrics["tactile_contact_relative"]
+            )
         selection += (
             float(self.section.get("probe_selection_weight", 0.001))
             * (2 - contact_auc - slip_auc)
@@ -884,6 +1018,7 @@ class ChainStageB:
             "selection_mode_tactile": float(
                 self.selection_mode == "tactile"
             ),
+            **category_metrics,
         }
         if not train:
             self._eval_features = {
@@ -995,6 +1130,23 @@ def main() -> None:
         choices=("composite", "tactile"),
         default=None,
     )
+    parser.add_argument(
+        "--window-sampling",
+        choices=("contact", "all", "mixed"),
+        default=None,
+        help="Training-window distribution for Stage B.",
+    )
+    parser.add_argument(
+        "--no-contact-fraction",
+        type=float,
+        default=None,
+        help="Upper no-contact fraction for mixed Stage-B sampling.",
+    )
+    parser.add_argument(
+        "--val-window-sampling",
+        choices=("contact", "all", "stratified"),
+        default=None,
+    )
     args = parser.parse_args()
     cfg = _load_config(args.config)
     if args.batch_size:
@@ -1064,6 +1216,16 @@ def main() -> None:
         cfg["predictor_training"]["use_state_history"] = False
     if args.selection_mode is not None:
         cfg["predictor_training"]["selection_mode"] = args.selection_mode
+    if args.window_sampling is not None:
+        cfg["window_sampling"] = args.window_sampling
+        cfg["train_window_sampling"] = args.window_sampling
+    if args.no_contact_fraction is not None:
+        cfg["no_contact_fraction"] = float(
+            args.no_contact_fraction
+        )
+    if args.val_window_sampling is not None:
+        cfg["val_window_sampling"] = args.val_window_sampling
+        cfg["test_window_sampling"] = args.val_window_sampling
     height, width = args.latent_grid.lower().split("x", 1)
     grid = (int(height), int(width))
     rank, world_size, device = setup_distributed()
@@ -1177,6 +1339,12 @@ def main() -> None:
     )
     scheduler.jump_to(start_step)
     if args.eval_only:
+        # Rank 0 evaluates serially.  Other ranks must not wait on a collective
+        # whose timeout can be shorter than a full held-out video pass.
+        if world_size > 1:
+            dist.barrier()
+        if rank != 0:
+            return
         test_batches = int(
             args.test_batches
             if args.test_batches is not None
@@ -1193,8 +1361,6 @@ def main() -> None:
                 encoding="utf-8",
             )
             print(f"[stageB] eval-only finished: {test}", flush=True)
-        if world_size > 1:
-            dist.barrier()
         return
     bad = 0
     records = {}
@@ -1296,7 +1462,14 @@ def main() -> None:
         else:
             continue
         break
-    if rank == 0 and test_loader is not None:
+    # All ranks synchronize once while rank 0 owns the selected checkpoint.
+    # A final test can take longer than the default NCCL collective timeout, so
+    # non-zero ranks exit before rank 0 starts the serial held-out evaluation.
+    if world_size > 1:
+        dist.barrier()
+    if rank != 0:
+        return
+    if test_loader is not None:
         state = torch.load(
             output / "best_predictor.pt",
             map_location=device,
@@ -1319,8 +1492,6 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"[stageB] finished best={best_step}@{best}", flush=True)
-    if world_size > 1:
-        dist.barrier()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # Original formal Stage-A recipe, retrained on the expanded dataset.
-manifest: /liury/src/lry-vjepa2/data/manifests/contact_v6_4chain_20261115/chains.jsonl
+manifest: /liury/src/lry-vjepa2/data/manifests/contact_v6_4chain_20261117/chains.jsonl
 protected_data_roots:
   - /data/upload/recorder_1
 seed: 1

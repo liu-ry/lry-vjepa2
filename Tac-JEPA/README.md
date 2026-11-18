@@ -66,6 +66,26 @@ output = model(
 部署路径只构造在线触觉编码器、视觉编码器和 predictor，不构造 EMA target
 编码器、contact/slip probes 或数据加载器。
 
+## Stage-B 窗口策略
+
+Stage A 和 Stage B 使用不同但显式的窗口策略：
+
+- Stage A 保持 `require_contact: true`，只让真实接触窗口训练触觉编码器，
+  避免大量无接触数据改变编码器分布。
+- Stage B 默认使用 `window_sampling: all`。视觉和机器人状态提供未来条件，
+  因此无接触窗口仍可参与训练；它们只根据 manifest 中触觉 stream 的有效性
+  保留，不会因为当前窗口没有 contact 而被清空 loss mask。
+- 需要控制分布时可选择：
+  - `contact`：只使用满足接触门限的窗口；
+  - `all`：自然全时间轴窗口；
+  - `mixed`：接触窗口加受 `no_contact_fraction` 限制的无接触窗口；
+  - `stratified`：固定数量的验证/测试窗口，在 ongoing、no-contact、
+    contact-start 和 contact-end 类别间分层。
+- 相邻窗口默认重叠 `1/3`。validation/test 可启用确定性打乱，避免重叠窗口
+  连续进入评估造成偏置。
+- `stage_b.example.yaml` 使用自然/all 训练窗口，并在验证中分别报告
+  contact、no-contact、start、ongoing 和 end 指标。
+
 ## 数据流程
 
 统一数据处理入口是 `tools/prepare_dataset.py`。它可以直接完成：

@@ -83,5 +83,27 @@ The resulting training manifests are
 `data/prepared/chains/chains.jsonl` and
 `data/prepared/chains/episodes_4chain.jsonl`.
 
+## Stage-B window policy
+
+The portable Stage-B trainer separates contact supervision from window
+eligibility:
+
+- Stage A remains contact-only.
+- Stage B defaults to `require_contact: false` and `window_sampling: all`.
+- A no-contact Stage-B window remains valid when its tactile stream exists; the
+  manifest `chain_valid` flags, not the current contact count, define the tactile
+  loss mask.
+- `train_window_sampling`, `val_window_sampling`, and
+  `test_window_sampling` independently support `contact`, `all`, and
+  `stratified`. Dense training also supports `mixed` with
+  `no_contact_fraction`.
+- Fixed-size validation/test views can be deterministically shuffled with
+  `shuffle_eval_windows: true`.
+- Adjacent windows overlap by `window_overlap: 0.3333333333333333` by default.
+
+The example Stage-B configuration uses natural/all training windows,
+contact-only Stage A, deterministic stratified evaluation, and no action input
+or action output.
+
 Data and checkpoints are intentionally not bundled. The copied module contains
 only code, configuration templates, tools, and tests.

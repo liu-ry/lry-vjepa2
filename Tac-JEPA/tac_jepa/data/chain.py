@@ -49,6 +49,9 @@ class ChainEpisodeDataset(Dataset):
         defer_image_conversion=False,
         balance_single_dual=True,
         dual_window_probability=0.5,
+        window_sampling="contact",
+        no_contact_fraction=None,
+        length_source="all",
     ):
         self.root = Path(manifest).parent
         if items is None:
@@ -69,6 +72,24 @@ class ChainEpisodeDataset(Dataset):
         self.window_overlap = float(window_overlap)
         if not 0.0 <= self.window_overlap < 1.0:
             raise ValueError("window_overlap must be in [0, 1)")
+        self.window_sampling = str(window_sampling).lower()
+        if self.window_sampling not in (
+            "contact",
+            "all",
+            "mixed",
+            "stratified",
+        ):
+            raise ValueError(
+                "window_sampling must be contact, all, mixed, or stratified"
+            )
+        if no_contact_fraction is not None:
+            no_contact_fraction = float(no_contact_fraction)
+            if not 0.0 <= no_contact_fraction < 1.0:
+                raise ValueError("no_contact_fraction must be in [0, 1)")
+        self.no_contact_fraction = no_contact_fraction
+        self.length_source = str(length_source).lower()
+        if self.length_source not in ("all", "contact"):
+            raise ValueError("length_source must be all or contact")
         self.random_crop = bool(random_crop)
         self.require_contact = bool(require_contact)
         self.min_contact_frames = max(1, int(min_contact_frames))
@@ -83,8 +104,11 @@ class ChainEpisodeDataset(Dataset):
         self._usable_length_cache = {}
         self._contact_window_cache = {}
         self._window_groups_cache = {}
+        self._window_category_cache = {}
+        self._all_start_cache = {}
         self._dense_start_cache = {}
         self._dense_window_counts = None
+        self._path_exists_cache = {}
         self.vision_helper = RobotVisionTactileDataset(
             manifest,
             context=self.context,
@@ -108,20 +132,52 @@ class ChainEpisodeDataset(Dataset):
         values = item.get(key)
         if not isinstance(values, list):
             values = [values] * 4
-        return [
-            str(self._resolve(path)) if path else None
-            for path in (list(values) + [None] * 4)[:4]
-        ]
+        paths = []
+        for path in (list(values) + [None] * 4)[:4]:
+            if not path:
+                paths.append(None)
+                continue
+            resolved = str(self._resolve(path))
+            exists = self._path_exists_cache.get(resolved)
+            if exists is None:
+                exists = Path(resolved).is_file()
+                self._path_exists_cache[resolved] = exists
+            paths.append(resolved if exists else None)
+        return paths
+
+    def _path_exists(self, path: Path) -> bool:
+        resolved = str(self._resolve(path))
+        exists = self._path_exists_cache.get(resolved)
+        if exists is None:
+            exists = Path(resolved).is_file()
+            self._path_exists_cache[resolved] = exists
+        return exists
+
+    def _available_path_group(self, group) -> bool:
+        return bool(group) and all(
+            self._path_exists(Path(path))
+            for path in _path_parts(group)
+        )
 
     def _usable_length(self, item: dict) -> int:
         cache_key = str(item["group"])
         cached = self._usable_length_cache.get(cache_key)
         if cached is not None:
             return int(cached)
+        if self.length_source == "contact":
+            contact_lengths = [
+                _sequence_length(Path(path))
+                for path in self._available_paths(item, "contact")
+                if path
+            ]
+            if contact_lengths:
+                length = min(contact_lengths)
+                self._usable_length_cache[cache_key] = length
+                return length
         lengths = []
         if self.load_vision:
             for group in item.get("vision_paths", []):
-                if group:
+                if self._available_path_group(group):
                     lengths.extend(
                         _sequence_length(self._resolve(path))
                         for path in _path_parts(group)
@@ -134,7 +190,7 @@ class ChainEpisodeDataset(Dataset):
                 lengths.append(_sequence_length(Path(path)))
         if self.load_state:
             for group in item.get("state_paths", []):
-                if group:
+                if self._available_path_group(group):
                     lengths.extend(
                         _sequence_length(self._resolve(path))
                         for path in _path_parts(group)
@@ -224,22 +280,129 @@ class ChainEpisodeDataset(Dataset):
             selected.append(int(candidates[-1]))
         return np.asarray(selected, dtype=np.int64)
 
+    def _all_window_starts(self, item: dict) -> np.ndarray:
+        cache_key = str(item["group"])
+        cached = self._all_start_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        count = self.context + self.horizon
+        usable = self._usable_length(item)
+        starts = (
+            self._dense_starts(
+                np.arange(0, usable - count + 1, dtype=np.int64),
+                count,
+            )
+            if usable >= count
+            else np.zeros(0, dtype=np.int64)
+        )
+        self._all_start_cache[cache_key] = starts
+        return starts
+
+    def _categorized_window_starts(
+        self, item: dict
+    ) -> dict[str, np.ndarray]:
+        cache_key = str(item["group"])
+        cached = self._window_category_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        contact = self._contact_matrix(item)
+        count = self.context + self.horizon
+        names = ("no_contact", "start", "ongoing", "end")
+        if len(contact) < count:
+            categories = {
+                name: np.zeros(0, dtype=np.int64) for name in names
+            }
+            self._window_category_cache[cache_key] = categories
+            return categories
+        all_starts = np.arange(
+            0, len(contact) - count + 1, dtype=np.int64
+        )
+        windows = np.lib.stride_tricks.sliding_window_view(
+            contact.astype(np.int32), count, axis=0
+        )[all_starts].transpose(0, 2, 1)
+        history_contact = windows[:, : self.context].any(axis=(1, 2))
+        future_contact = windows[:, self.context :].any(axis=(1, 2))
+        categories = {
+            "no_contact": all_starts[
+                ~history_contact & ~future_contact
+            ],
+            "start": all_starts[~history_contact & future_contact],
+            "ongoing": all_starts[history_contact & future_contact],
+            "end": all_starts[history_contact & ~future_contact],
+        }
+        self._window_category_cache[cache_key] = categories
+        return categories
+
+    @staticmethod
+    def _uniform_subset(
+        values: np.ndarray, target: int
+    ) -> np.ndarray:
+        values = np.asarray(values, dtype=np.int64)
+        target = int(target)
+        if target <= 0 or len(values) == 0:
+            return values[:0]
+        if target >= len(values):
+            return values
+        positions = np.rint(
+            np.linspace(0, len(values) - 1, target)
+        ).astype(np.int64)
+        return values[np.unique(positions)]
+
     def _item_dense_starts(self, item: dict) -> np.ndarray:
         cache_key = str(item["group"])
         cached = self._dense_start_cache.get(cache_key)
         if cached is not None:
             return cached
         count = self.context + self.horizon
-        if self.require_contact:
+        if self.window_sampling == "contact":
             candidates = self.contact_window_starts(item)
+            starts = self._dense_starts(candidates, count)
+        elif self.window_sampling == "all":
+            starts = self._all_window_starts(item)
+        elif self.window_sampling == "mixed":
+            all_starts = self._all_window_starts(item)
+            if (
+                self.no_contact_fraction is None
+                or len(all_starts) == 0
+            ):
+                starts = all_starts
+            else:
+                categories = self._categorized_window_starts(item)
+                no_contact = self._dense_starts(
+                    categories["no_contact"], count
+                )
+                contact = np.sort(
+                    np.concatenate(
+                        (
+                            categories["start"],
+                            categories["ongoing"],
+                            categories["end"],
+                        )
+                    )
+                )
+                contact = self._dense_starts(contact, count)
+                if len(contact) == 0:
+                    starts = no_contact
+                else:
+                    fraction = self.no_contact_fraction
+                    target_no_contact = int(
+                        len(contact)
+                        * fraction
+                        / max(1e-6, 1.0 - fraction)
+                    )
+                    no_contact = self._uniform_subset(
+                        no_contact, target_no_contact
+                    )
+                    starts = np.sort(
+                        np.unique(
+                            np.concatenate((contact, no_contact))
+                        )
+                    )
         else:
-            usable = self._usable_length(item)
-            candidates = (
-                np.arange(0, usable - count + 1, dtype=np.int64)
-                if usable >= count
-                else np.zeros(0, dtype=np.int64)
+            raise ValueError(
+                "window_sampling='stratified' is only valid for fixed "
+                "validation/test window counts"
             )
-        starts = self._dense_starts(candidates, count)
         self._dense_start_cache[cache_key] = starts
         return starts
 
@@ -276,7 +439,6 @@ class ChainEpisodeDataset(Dataset):
             raise ValueError(
                 f"episode {item['group']!r} has {usable} frames < {n}"
             )
-        starts = self.contact_window_starts(item) if self.require_contact else None
         if self.dense_windows:
             dense_starts = self._item_dense_starts(item)
             if len(dense_starts) == 0:
@@ -284,37 +446,60 @@ class ChainEpisodeDataset(Dataset):
                     f"episode {item['group']!r} has no usable window"
                 )
             start = int(dense_starts[local_window])
-        elif starts is not None:
+        elif self.random_crop:
+            if self.window_sampling == "contact":
+                starts = self.contact_window_starts(item)
+                if not len(starts):
+                    raise ValueError(
+                        f"episode {item['group']!r} has no contact window"
+                    )
+                start = int(random.choice(starts.tolist()))
+            else:
+                start = random.randint(0, usable - n)
+        elif self.window_sampling == "stratified":
+            categories = self._categorized_window_starts(item)
+            category_order = ("ongoing", "no_contact", "start", "end")
+            candidates = np.zeros(0, dtype=np.int64)
+            for offset in range(len(category_order)):
+                category = category_order[
+                    (item_index + local_window + offset)
+                    % len(category_order)
+                ]
+                candidates = categories[category]
+                if len(candidates):
+                    break
+            if len(candidates) == 0:
+                raise ValueError(
+                    f"episode {item['group']!r} has no usable window"
+                )
+            start = int(
+                candidates[(local_window + index) % len(candidates)]
+            )
+        elif self.window_sampling == "contact":
+            starts = self.contact_window_starts(item)
             if not len(starts):
-                raise ValueError(f"episode {item['group']!r} has no contact window")
+                raise ValueError(
+                    f"episode {item['group']!r} has no contact window"
+                )
             groups = self._window_groups_cache.get(str(item["group"]), {})
             dual = groups.get("dual", np.zeros(0, dtype=np.int64))
             single = groups.get("single", np.zeros(0, dtype=np.int64))
-            if self.random_crop:
-                candidates = starts
-                if (
-                    self.balance_single_dual
-                    and len(dual)
-                    and random.random() < self.dual_window_probability
-                ):
+            candidates = starts
+            if self.balance_single_dual:
+                if local_window % 2 == 0 and len(dual):
                     candidates = dual
-                elif self.balance_single_dual and len(single):
+                elif len(single):
                     candidates = single
-                start = int(random.choice(candidates.tolist()))
-            else:
-                candidates = starts
-                if self.balance_single_dual:
-                    if local_window % 2 == 0 and len(dual):
-                        candidates = dual
-                    elif len(single):
-                        candidates = single
-                start = int(
-                    candidates[(local_window + index) % len(candidates)]
-                )
-        elif self.random_crop:
-            start = random.randint(0, usable - n)
+            start = int(
+                candidates[(local_window + index) % len(candidates)]
+            )
         else:
-            start = 0
+            starts = self._all_window_starts(item)
+            if len(starts) == 0:
+                raise ValueError(
+                    f"episode {item['group']!r} has no usable window"
+                )
+            start = int(starts[(local_window + index) % len(starts)])
 
         tactile_paths = self._available_paths(item, "tactile")
         contact_paths = self._available_paths(item, "contact")
@@ -353,9 +538,13 @@ class ChainEpisodeDataset(Dataset):
             svalue = np.asarray(_load_window(Path(spath), start, n)).reshape(n)
             contact[:, chain] = cvalue > 0
             slip[:, chain] = svalue > 0
-        chain_valid = (
-            torch.tensor([path is not None for path in tactile_paths])
-            & torch.tensor(contact.sum(axis=0) >= self.min_chain_contact_frames)
+        manifest_chain_valid = item.get(
+            "chain_valid", [True] * len(tactile_paths)
+        )
+        chain_valid = torch.tensor(
+            [path is not None for path in tactile_paths]
+        ) & torch.tensor(
+            [bool(value) for value in manifest_chain_valid[:4]]
         )
 
         out = {
@@ -365,11 +554,27 @@ class ChainEpisodeDataset(Dataset):
             "slip": torch.from_numpy(slip),
             "group": item["group"],
         }
+        vision_groups = list(item.get("vision_paths", [None, None]))[:2]
+        state_groups = list(item.get("state_paths", [None, None]))[:2]
+        vision_available = torch.tensor(
+            [self._available_path_group(group) for group in vision_groups]
+            + [False] * (2 - len(vision_groups))
+        )
+        state_available = torch.tensor(
+            [self._available_path_group(group) for group in state_groups]
+            + [False] * (2 - len(state_groups))
+        )
+        manifest_arm_valid = torch.tensor(
+            item.get("arm_valid", [True, True]), dtype=torch.bool
+        )
+        arm_valid = manifest_arm_valid & (
+            vision_available | state_available
+        )
         if self.load_vision:
             vision_arms = []
             template_vision = None
             for group in item.get("vision_paths", [None, None]):
-                if group:
+                if self._available_path_group(group):
                     vision = _load_parts(
                         tuple(
                             self._resolve(path)
@@ -395,13 +600,12 @@ class ChainEpisodeDataset(Dataset):
             if vision_arms[1] is None:
                 vision_arms[1] = vision_arms[0]
             out["vision_arms"] = torch.stack(vision_arms, dim=0)
-            out["arm_valid"] = torch.tensor(item.get("arm_valid", [True, True]))
             out["vision"] = out["vision_arms"][0]
         if self.load_state:
             state_arms = []
             template_state = None
             for group in item.get("state_paths", [None, None]):
-                if group:
+                if self._available_path_group(group):
                     state = _load_parts(
                         tuple(
                             self._resolve(path)
@@ -424,6 +628,6 @@ class ChainEpisodeDataset(Dataset):
             if state_arms[1] is None:
                 state_arms[1] = state_arms[0]
             out["state_arms"] = torch.stack(state_arms, dim=0)
-            out["arm_valid"] = torch.tensor(item.get("arm_valid", [True, True]))
             out["state"] = out["state_arms"][0]
+        out["arm_valid"] = arm_valid
         return out

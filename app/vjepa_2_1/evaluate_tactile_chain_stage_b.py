@@ -39,19 +39,30 @@ def _filter_loader_groups(
     if groups is None:
         return loader
     dataset = loader.dataset
-    if dataset.dense_windows:
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        allowed_indices = set(dataset.indices)
+    else:
+        base_dataset = dataset
+        allowed_indices = None
+    if base_dataset.dense_windows:
         raise ValueError(
             "group filtering expects a fixed-window dataset; "
             "set windows_per_episode before building evaluation loaders"
         )
     indices = []
-    for item_index, item in enumerate(dataset.items):
+    for item_index, item in enumerate(base_dataset.items):
         if str(item["group"]) not in groups:
             continue
-        offset = item_index * dataset.windows_per_episode
-        indices.extend(
-            range(offset, offset + dataset.windows_per_episode)
+        offset = item_index * base_dataset.windows_per_episode
+        item_indices = list(
+            range(offset, offset + base_dataset.windows_per_episode)
         )
+        if allowed_indices is not None:
+            item_indices = [
+                index for index in item_indices if index in allowed_indices
+            ]
+        indices.extend(item_indices)
     if not indices:
         raise ValueError("group filtering produced an empty loader")
     kwargs = {
@@ -65,7 +76,7 @@ def _filter_loader_groups(
             prefetch_factor=loader.prefetch_factor,
             persistent_workers=loader.persistent_workers,
         )
-    return DataLoader(Subset(dataset, indices), **kwargs)
+    return DataLoader(Subset(base_dataset, indices), **kwargs)
 
 
 def _collect(trainer, loader, max_batches: int):
@@ -252,10 +263,21 @@ def main() -> None:
         default=None,
         help="Optional JSON list of episode groups for held-out probes.",
     )
+    parser.add_argument(
+        "--window-sampling",
+        choices=("contact", "all", "stratified"),
+        default=None,
+        help="Use one deterministic window distribution for fair comparisons.",
+    )
     args = parser.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     random.seed(731)
     torch.manual_seed(731)
+    if args.window_sampling is not None:
+        cfg["window_sampling"] = args.window_sampling
+        cfg["train_window_sampling"] = args.window_sampling
+        cfg["val_window_sampling"] = args.window_sampling
+        cfg["test_window_sampling"] = args.window_sampling
     train_groups = _load_groups(args.train_groups)
     test_groups = _load_groups(args.test_groups)
     if train_groups is not None:
